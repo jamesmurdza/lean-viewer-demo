@@ -127,32 +127,14 @@ const PAGE = `<!DOCTYPE html>
     position: sticky;
     top: 0;
   }
-  header h1 {
-    font-size: 15px;
-    font-weight: 600;
-    margin: 0;
-    color: #79c0ff;
-  }
   header .file {
-    font-size: 12px;
-    color: #8b949e;
+    font-size: 13px;
+    color: #e6edf3;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
-  .badges { display: flex; align-items: center; gap: 6px; }
-  .badge {
-    font-size: 12px;
-    padding: 3px 9px;
-    border-radius: 999px;
-    background: #1a3f2e;
-    color: #7ee2a8;
-    white-space: nowrap;
-  }
-  .badge.bad { background: #3f1a1a; color: #e27e7e; }
-  .badge.warn { background: #3f351a; color: #e2c87e; }
   main {
-    padding: 24px;
-    max-width: 980px;
-    margin: 0 auto;
+    padding: 0;
+    margin: 0;
   }
   #codewrap pre {
     margin: 0;
@@ -213,13 +195,7 @@ const PAGE = `<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>&#955; Lean Live Viewer</h1>
   <span class="file" id="filepath"></span>
-  <div class="badges">
-    <span class="badge" id="diagbadge" style="display:none"></span>
-    <span class="badge" id="leanbadge">lean: starting&hellip;</span>
-    <span class="badge" id="status">connecting&hellip;</span>
-  </div>
 </header>
 <main>
   <div id="codewrap"><pre><code>loading&hellip;</code></pre></div>
@@ -229,9 +205,6 @@ const PAGE = `<!DOCTYPE html>
 <script>
 (function () {
   var codewrap = document.getElementById('codewrap');
-  var statusEl = document.getElementById('status');
-  var leanbadge = document.getElementById('leanbadge');
-  var diagbadge = document.getElementById('diagbadge');
   var fileEl = document.getElementById('filepath');
   var tooltip = document.getElementById('tooltip');
 
@@ -426,48 +399,12 @@ const PAGE = `<!DOCTYPE html>
   });
 
   // --- SSE live updates ---
-  function setLeanBadge(status) {
-    leanbadge.classList.remove('bad', 'warn');
-    if (status === 'ready') {
-      leanbadge.textContent = 'lean: ready';
-    } else if (status === 'elaborating') {
-      leanbadge.textContent = 'lean: elaborating\\u2026';
-      leanbadge.classList.add('warn');
-    } else if (status === 'crashed') {
-      leanbadge.textContent = 'lean: crashed';
-      leanbadge.classList.add('bad');
-    } else {
-      leanbadge.textContent = 'lean: starting\\u2026';
-      leanbadge.classList.add('warn');
-    }
-  }
-
-  function setDiagBadge(count) {
-    if (count > 0) {
-      diagbadge.style.display = '';
-      diagbadge.textContent = count + (count === 1 ? ' issue' : ' issues');
-      diagbadge.classList.add('warn');
-    } else {
-      diagbadge.style.display = 'none';
-    }
-  }
-
   function connect() {
     var es = new EventSource('/events');
-    es.onopen = function () {
-      statusEl.textContent = 'live';
-      statusEl.classList.remove('bad');
-    };
-    es.onerror = function () {
-      statusEl.textContent = 'reconnecting\\u2026';
-      statusEl.classList.add('bad');
-    };
     es.onmessage = function (e) {
       var data = JSON.parse(e.data);
       fileEl.textContent = data.file;
       render(data.html);
-      setLeanBadge(data.leanStatus);
-      setDiagBadge(data.diagnosticsCount || 0);
       hideTooltip();
     };
   }
