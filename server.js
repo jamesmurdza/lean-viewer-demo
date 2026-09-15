@@ -19,13 +19,16 @@ const LEAN_FILE = process.env.LEAN_FILE
   ? path.resolve(process.env.LEAN_FILE)
   : path.join(__dirname, 'lean', 'Test.lean');
 
-const THEME = 'github-dark-default';
+const THEMES = {
+  dark: { shiki: 'github-dark-default', bg: '#0d1117', fg: '#e6edf3' },
+  light: { shiki: 'github-light-default', bg: '#ffffff', fg: '#1f2328' },
+};
 
 let clients = [];
 let highlighter = null;
 let leanStatus = 'starting'; // starting | elaborating | ready | crashed
 let diagnosticsCount = 0;
-let currentHtml = '';
+let currentHtml = { dark: '', light: '' };
 
 function readFileSafe() {
   try {
@@ -42,21 +45,55 @@ function escapeHtml(s) {
     .replace(/>/g, '&gt;');
 }
 
-function renderHtml(content) {
-  if (highlighter) {
-    try {
-      return highlighter.codeToHtml(content, { lang: 'lean', theme: THEME });
-    } catch (err) {
-      console.error(`Shiki highlight failed: ${err.message}`);
-    }
+// Splits a colored Shiki token's text into hoverable sub-spans: runs of
+// word characters (identifiers/numbers), runs of whitespace (left
+// unwrapped — nothing to hover), or single other characters (operators,
+// punctuation, unicode notation like → ∀ λ). This lets the browser use
+// real DOM elements + real `mouseover` events for hover targeting,
+// instead of computing a character offset from mouse pixel coordinates.
+const SUBTOKEN_RE = /[\p{L}\p{N}_][\p{L}\p{N}_'!?]*|\s+|./gsu;
+
+function renderHtmlForTheme(content, themeKey) {
+  const theme = THEMES[themeKey];
+  if (!highlighter) {
+    return `<pre class="shiki-fallback"><code>${escapeHtml(content)}</code></pre>`;
   }
-  // Fallback: plain escaped text if the highlighter isn't ready yet or errors.
-  return `<pre class="shiki-fallback"><code>${escapeHtml(content)}</code></pre>`;
+  try {
+    const lines = highlighter.codeToTokensBase(content, { lang: 'lean', theme: theme.shiki });
+    let body = '';
+    lines.forEach((lineTokens, lineIdx) => {
+      let ch = 0;
+      let lineHtml = '';
+      for (const tok of lineTokens) {
+        const color = tok.color || theme.fg;
+        const pieces = tok.content.match(SUBTOKEN_RE) || [tok.content];
+        for (const piece of pieces) {
+          if (/^\s+$/.test(piece)) {
+            lineHtml += escapeHtml(piece);
+          } else {
+            lineHtml += `<span class="tok" data-line="${lineIdx}" data-ch="${ch}" style="color:${color}">${escapeHtml(piece)}</span>`;
+          }
+          ch += piece.length;
+        }
+      }
+      body += `<span class="line">${lineHtml}</span>\n`;
+    });
+    body = body.replace(/\n$/, '');
+    return `<pre class="shiki-tok" tabindex="0"><code>${body}</code></pre>`;
+  } catch (err) {
+    console.error(`Shiki tokenize failed: ${err.message}`);
+    return `<pre class="shiki-fallback"><code>${escapeHtml(content)}</code></pre>`;
+  }
+}
+
+function renderHtml(content) {
+  return { dark: renderHtmlForTheme(content, 'dark'), light: renderHtmlForTheme(content, 'light') };
 }
 
 function sendToAll() {
   const payload = `data: ${JSON.stringify({
-    html: currentHtml,
+    htmlDark: currentHtml.dark,
+    htmlLight: currentHtml.light,
     file: LEAN_FILE,
     leanStatus,
     diagnosticsCount,
@@ -106,53 +143,88 @@ const PAGE = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8" />
 <title>Lean Live Viewer</title>
+<script>
+// Applied synchronously (before first paint) to avoid a flash of the
+// wrong theme when a saved preference exists.
+(function () {
+  try {
+    if (localStorage.getItem('lean-viewer-theme') === 'light') {
+      document.documentElement.classList.add('light');
+    }
+  } catch (e) {}
+})();
+</script>
 <style>
-  :root { color-scheme: dark; }
+  :root {
+    color-scheme: dark;
+    --bg: #0d1117;
+    --fg: #e6edf3;
+    --muted: #8b949e;
+    --border: #21262d;
+    --statusbar-bg: #010409;
+    --tooltip-bg: #161b22;
+    --tooltip-border: #30363d;
+    --tooltip-code-bg: #0d1117;
+    --accent: #58a6ff;
+    --gutter: #484f58;
+    --btn-bg: #21262d;
+    --btn-fg: #e6edf3;
+  }
+  html.light {
+    color-scheme: light;
+    --bg: #ffffff;
+    --fg: #1f2328;
+    --muted: #59636e;
+    --border: #d0d7de;
+    --statusbar-bg: #f6f8fa;
+    --tooltip-bg: #f6f8fa;
+    --tooltip-border: #d0d7de;
+    --tooltip-code-bg: #ffffff;
+    --accent: #0969da;
+    --gutter: #8c959f;
+    --btn-bg: #eaeef2;
+    --btn-fg: #1f2328;
+  }
   * { box-sizing: border-box; }
-  body {
+  html, body {
+    height: 100%;
     margin: 0;
+    overflow-x: hidden;
+  }
+  body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-    background: #0d1117;
-    color: #e6edf3;
-  }
-  header {
-    padding: 14px 22px;
-    background: #010409;
-    border-bottom: 1px solid #21262d;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    flex-wrap: wrap;
-    gap: 8px;
-    position: sticky;
-    top: 0;
-  }
-  header .file {
-    font-size: 13px;
-    color: #e6edf3;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--bg);
+    color: var(--fg);
   }
   main {
     padding: 0;
-    margin: 0;
+    margin: 0 0 34px 0;
+    width: 100%;
+    max-width: 100%;
+  }
+  #codewrap {
+    width: 100%;
+    max-width: 100%;
   }
   #codewrap pre {
     margin: 0;
+    width: 100%;
+    max-width: 100%;
     padding: 18px 20px;
-    border-radius: 8px;
-    border: 1px solid #21262d;
     font-size: 14px;
     line-height: 1.6;
     overflow-x: auto;
+    background: var(--bg);
+    color: var(--fg);
   }
   #codewrap code {
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     counter-reset: line;
   }
   #codewrap .line {
-    display: inline-block;
-    width: 100%;
+    display: block;
     cursor: default;
+    min-width: max-content;
   }
   #codewrap .line::before {
     counter-increment: line;
@@ -161,32 +233,79 @@ const PAGE = `<!DOCTYPE html>
     width: 2.2em;
     margin-right: 1em;
     text-align: right;
-    color: #484f58;
+    color: var(--gutter);
     user-select: none;
   }
+  #codewrap .tok.tok-hover {
+    background: rgba(88, 166, 255, 0.18);
+    border-radius: 3px;
+    box-shadow: 0 0 0 1px rgba(88, 166, 255, 0.4);
+    filter: brightness(1.2);
+  }
+  #statusbar {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 34px;
+    padding: 0 12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: var(--statusbar-bg);
+    border-top: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--muted);
+    z-index: 500;
+  }
+  #statusbar .file {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  #themeToggle {
+    flex: 0 0 auto;
+    margin-left: 12px;
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--btn-bg);
+    color: var(--btn-fg);
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+    padding: 0;
+  }
+  #themeToggle:hover { filter: brightness(1.2); }
   #tooltip {
     position: fixed;
     z-index: 1000;
     max-width: 520px;
-    background: #161b22;
-    border: 1px solid #30363d;
+    background: var(--tooltip-bg);
+    border: 1px solid var(--tooltip-border);
     border-radius: 6px;
     padding: 10px 12px;
     font-size: 12.5px;
     line-height: 1.5;
-    box-shadow: 0 8px 24px rgba(1,4,9,0.6);
+    color: var(--fg);
+    box-shadow: 0 8px 24px rgba(1,4,9,0.35);
     pointer-events: none;
     display: none;
   }
   #tooltip p { margin: 0 0 6px 0; }
   #tooltip p:last-child { margin-bottom: 0; }
-  #tooltip hr { border: none; border-top: 1px solid #30363d; margin: 8px 0; }
-  #tooltip code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: #0d1117; padding: 1px 4px; border-radius: 3px; }
+  #tooltip hr { border: none; border-top: 1px solid var(--tooltip-border); margin: 8px 0; }
+  #tooltip code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--tooltip-code-bg); padding: 1px 4px; border-radius: 3px; }
   #tooltip pre.tt-code {
     margin: 0 0 6px 0;
     padding: 8px 10px;
-    background: #0d1117;
-    border: 1px solid #21262d;
+    background: var(--tooltip-code-bg);
+    border: 1px solid var(--tooltip-border);
     border-radius: 4px;
     overflow-x: auto;
   }
@@ -194,12 +313,13 @@ const PAGE = `<!DOCTYPE html>
 </style>
 </head>
 <body>
-<header>
-  <span class="file" id="filepath"></span>
-</header>
 <main>
   <div id="codewrap"><pre><code>loading&hellip;</code></pre></div>
 </main>
+<div id="statusbar">
+  <span class="file" id="filepath"></span>
+  <button id="themeToggle" title="Toggle light/dark theme">&#127769;</button>
+</div>
 <div id="tooltip"></div>
 
 <script>
@@ -207,9 +327,9 @@ const PAGE = `<!DOCTYPE html>
   var codewrap = document.getElementById('codewrap');
   var fileEl = document.getElementById('filepath');
   var tooltip = document.getElementById('tooltip');
+  var themeToggle = document.getElementById('themeToggle');
 
-  var lineEls = [];
-  var charWidthPx = null;
+  var lineTokMap = null; // Map<lineNumber, Element[]> of .tok spans, for range highlighting
 
   function escapeHtml(s) {
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -245,54 +365,64 @@ const PAGE = `<!DOCTYPE html>
     return out;
   }
 
-  function measureCharWidth() {
-    var codeEl = codewrap.querySelector('code');
-    if (!codeEl) return 8;
-    var cs = getComputedStyle(codeEl);
-    var probe = document.createElement('span');
-    probe.style.position = 'absolute';
-    probe.style.visibility = 'hidden';
-    probe.style.whiteSpace = 'pre';
-    probe.style.fontFamily = cs.fontFamily;
-    probe.style.fontSize = cs.fontSize;
-    probe.textContent = 'M'.repeat(40);
-    document.body.appendChild(probe);
-    var w = probe.getBoundingClientRect().width / 40;
-    probe.remove();
-    return w || 8;
-  }
-
-  function lineTextStartX(lineEl) {
-    // A collapsed Range positioned before the line's real text nodes
-    // (i.e. after any ::before pseudo-element content) gives the exact
-    // caret x-position where the actual source text begins — this
-    // works regardless of the line-number gutter's CSS width.
-    try {
-      var range = document.createRange();
-      range.setStart(lineEl, 0);
-      range.setEnd(lineEl, 0);
-      var rects = range.getClientRects();
-      if (rects.length) return rects[0].left;
-    } catch (e) {}
-    return lineEl.getBoundingClientRect().left;
-  }
-
-  function indexLines() {
-    lineEls = Array.prototype.slice.call(codewrap.querySelectorAll('.line'));
-    charWidthPx = measureCharWidth();
+  function indexTokens() {
+    lineTokMap = new Map();
+    var toks = codewrap.querySelectorAll('.tok');
+    for (var i = 0; i < toks.length; i++) {
+      var el = toks[i];
+      var line = parseInt(el.getAttribute('data-line'), 10);
+      var bucket = lineTokMap.get(line);
+      if (!bucket) { bucket = []; lineTokMap.set(line, bucket); }
+      bucket.push(el);
+    }
   }
 
   function render(html) {
     codewrap.innerHTML = html;
-    indexLines();
+    indexTokens();
   }
 
+  // --- theme (light/dark) ---
+  var lastData = null; // most recent SSE payload, so toggling is instant (no refetch)
+
+  function currentTheme() {
+    return document.documentElement.classList.contains('light') ? 'light' : 'dark';
+  }
+
+  function updateThemeToggleIcon() {
+    themeToggle.textContent = currentTheme() === 'light' ? '\\u2600\\ufe0f' : '\\ud83c\\udf19';
+  }
+
+  function renderForCurrentTheme() {
+    if (!lastData) return;
+    render(currentTheme() === 'light' ? lastData.htmlLight : lastData.htmlDark);
+  }
+
+  function setTheme(theme) {
+    document.documentElement.classList.toggle('light', theme === 'light');
+    try { localStorage.setItem('lean-viewer-theme', theme); } catch (e) {}
+    updateThemeToggleIcon();
+    renderForCurrentTheme();
+    hideTooltip();
+  }
+
+  themeToggle.addEventListener('click', function () {
+    setTheme(currentTheme() === 'light' ? 'dark' : 'light');
+  });
+
+  updateThemeToggleIcon();
+
   // --- hover interaction ---
+  // Driven entirely by real mouseover events on real .tok spans (each
+  // carrying its own data-line/data-ch), not mouse-coordinate math. This
+  // is cheaper (the browser only fires on element-enter, not every
+  // mousemove) and lets us highlight the exact hovered token(s) by
+  // toggling a class, using the range Lean's language server reports.
   var lastKey = null;
   var lastRange = null;
+  var hoveredEls = [];
   var hoverDebounce = null;
   var currentAbort = null;
-  var lastMouseX = 0, lastMouseY = 0;
 
   function withinRange(line, ch, range) {
     if (!range) return false;
@@ -303,37 +433,53 @@ const PAGE = `<!DOCTYPE html>
     return true;
   }
 
-  function positionTooltip() {
-    var pad = 14;
-    var x = lastMouseX + 14;
-    var y = lastMouseY + 18;
+  function clearHighlight() {
+    for (var i = 0; i < hoveredEls.length; i++) hoveredEls[i].classList.remove('tok-hover');
+    hoveredEls = [];
+  }
+
+  function applyHighlightForRange(range) {
+    clearHighlight();
+    if (!range || !lineTokMap) return;
+    for (var line = range.start.line; line <= range.end.line; line++) {
+      var bucket = lineTokMap.get(line);
+      if (!bucket) continue;
+      for (var i = 0; i < bucket.length; i++) {
+        var el = bucket[i];
+        var ch = parseInt(el.getAttribute('data-ch'), 10);
+        if (line === range.start.line && ch < range.start.character) continue;
+        if (line === range.end.line && ch >= range.end.character) continue;
+        el.classList.add('tok-hover');
+        hoveredEls.push(el);
+      }
+    }
+  }
+
+  function positionTooltipNear(el) {
+    var pad = 12;
+    var rect = el.getBoundingClientRect();
+    var x = rect.left;
+    var y = rect.bottom + 6;
     tooltip.style.left = x + 'px';
     tooltip.style.top = y + 'px';
-    // Clamp after layout so we know its size.
     requestAnimationFrame(function () {
-      var rect = tooltip.getBoundingClientRect();
+      var trect = tooltip.getBoundingClientRect();
       var nx = x, ny = y;
-      if (rect.right > window.innerWidth - pad) nx = Math.max(pad, window.innerWidth - pad - rect.width);
-      if (rect.bottom > window.innerHeight - pad) ny = Math.max(pad, lastMouseY - rect.height - 10);
+      if (trect.right > window.innerWidth - pad) nx = Math.max(pad, window.innerWidth - pad - trect.width);
+      if (trect.bottom > window.innerHeight - pad) ny = Math.max(pad, rect.top - trect.height - 8);
       tooltip.style.left = nx + 'px';
       tooltip.style.top = ny + 'px';
     });
   }
 
-  function showTooltip(html) {
-    if (!html) { hideTooltip(); return; }
-    tooltip.innerHTML = html;
-    tooltip.style.display = 'block';
-    positionTooltip();
-  }
-
   function hideTooltip() {
     tooltip.style.display = 'none';
+    clearHighlight();
     lastRange = null;
     lastKey = null;
   }
 
-  function fetchHover(line, character) {
+  function fetchHover(line, character, el) {
     if (currentAbort) currentAbort.abort();
     var ctrl = new AbortController();
     currentAbort = ctrl;
@@ -346,55 +492,53 @@ const PAGE = `<!DOCTYPE html>
       .then(function (r) { return r.json(); })
       .then(function (data) {
         if (data && data.contents && data.contents.value) {
-          lastRange = data.range || {
+          var range = data.range || {
             start: { line: line, character: character },
             end: { line: line, character: character + 1 },
           };
-          showTooltip(renderMarkdownLite(data.contents.value));
+          lastRange = range;
+          applyHighlightForRange(range);
+          tooltip.innerHTML = renderMarkdownLite(data.contents.value);
+          tooltip.style.display = 'block';
+          positionTooltipNear(el);
         } else {
           lastRange = {
             start: { line: line, character: character },
             end: { line: line, character: character + 1 },
           };
-          hideTooltip();
+          clearHighlight();
+          tooltip.style.display = 'none';
         }
       })
       .catch(function () { /* aborted or server hiccup — ignore */ });
   }
 
-  function onMouseMove(e) {
-    lastMouseX = e.clientX;
-    lastMouseY = e.clientY;
+  function onMouseOver(e) {
+    var el = e.target.closest ? e.target.closest('.tok') : null;
+    if (!el) return;
 
-    var lineEl = e.target.closest ? e.target.closest('.line') : null;
-    if (!lineEl) { hideTooltip(); return; }
-    var line = lineEls.indexOf(lineEl);
-    if (line === -1) { hideTooltip(); return; }
+    var line = parseInt(el.getAttribute('data-line'), 10);
+    var ch = parseInt(el.getAttribute('data-ch'), 10);
 
-    if (charWidthPx == null) indexLines();
-    var startX = lineTextStartX(lineEl);
-    var rel = e.clientX - startX;
-    if (rel < 0) { hideTooltip(); return; }
-    var character = Math.floor(rel / charWidthPx);
+    // Moving within the same already-resolved token (e.g. between two
+    // adjacent sub-spans Lean treats as one syntax node) — keep showing
+    // what's already there, no new request.
+    if (lastRange && withinRange(line, ch, lastRange)) return;
 
-    if (lastRange && withinRange(line, character, lastRange)) {
-      if (tooltip.style.display === 'block') positionTooltip();
-      return;
-    }
-
-    var key = line + ':' + character;
+    var key = line + ':' + ch;
     if (key === lastKey) return;
     lastKey = key;
 
     clearTimeout(hoverDebounce);
     hoverDebounce = setTimeout(function () {
-      fetchHover(line, character);
-    }, 100);
+      fetchHover(line, ch, el);
+    }, 80);
   }
 
-  codewrap.addEventListener('mousemove', onMouseMove);
+  codewrap.addEventListener('mouseover', onMouseOver);
   codewrap.addEventListener('mouseleave', function () {
     clearTimeout(hoverDebounce);
+    if (currentAbort) currentAbort.abort();
     hideTooltip();
   });
 
@@ -403,8 +547,9 @@ const PAGE = `<!DOCTYPE html>
     var es = new EventSource('/events');
     es.onmessage = function (e) {
       var data = JSON.parse(e.data);
+      lastData = data;
       fileEl.textContent = data.file;
-      render(data.html);
+      renderForCurrentTheme();
       hideTooltip();
     };
   }
@@ -425,7 +570,13 @@ const server = http.createServer((req, res) => {
     res.write('\n');
     clients.push(res);
     res.write(
-      `data: ${JSON.stringify({ html: currentHtml, file: LEAN_FILE, leanStatus, diagnosticsCount })}\n\n`
+      `data: ${JSON.stringify({
+        htmlDark: currentHtml.dark,
+        htmlLight: currentHtml.light,
+        file: LEAN_FILE,
+        leanStatus,
+        diagnosticsCount,
+      })}\n\n`
     );
     req.on('close', () => {
       clients = clients.filter((c) => c !== res);
@@ -470,7 +621,10 @@ const server = http.createServer((req, res) => {
 
 async function main() {
   const { createHighlighter } = await import('shiki');
-  highlighter = await createHighlighter({ themes: [THEME], langs: ['lean'] });
+  highlighter = await createHighlighter({
+    themes: [THEMES.dark.shiki, THEMES.light.shiki],
+    langs: ['lean'],
+  });
 
   const initialContent = readFileSafe();
   currentHtml = renderHtml(initialContent);
