@@ -111,9 +111,11 @@ function renderHtmlForTheme(content, themeKey) {
           ch += piece.length;
         }
       }
-      body += `<span class="line">${lineHtml}</span>\n`;
+      // No trailing newline here: .line is already `display: block`, so it
+      // provides its own line break. Adding a literal "\n" too (inside a
+      // whitespace-preserving <pre>) doubled every line's vertical gap.
+      body += `<span class="line">${lineHtml || '&#8203;'}</span>`;
     });
-    body = body.replace(/\n$/, '');
     return `<pre class="shiki-tok" tabindex="0"><code>${body}</code></pre>`;
   } catch (err) {
     console.error(`Shiki tokenize failed: ${err.message}`);
@@ -303,6 +305,7 @@ const PAGE = `<!DOCTYPE html>
     padding: 0 16px;
     display: flex;
     align-items: center;
+    justify-content: flex-end;
     gap: 10px;
     background: var(--statusbar-bg);
     border-bottom: 1px solid var(--border);
@@ -322,6 +325,21 @@ const PAGE = `<!DOCTYPE html>
     color: var(--btn-fg);
     cursor: pointer;
   }
+  #proofSelect:disabled {
+    cursor: wait;
+    opacity: 0.6;
+  }
+  .spinner {
+    display: none;
+    width: 13px;
+    height: 13px;
+    border-radius: 50%;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    animation: spin 0.7s linear infinite;
+  }
+  .spinner.active { display: inline-block; }
+  @keyframes spin { to { transform: rotate(360deg); } }
   #codewrap {
     width: 100%;
     max-width: 100%;
@@ -356,11 +374,18 @@ const PAGE = `<!DOCTYPE html>
     color: var(--gutter);
     user-select: none;
   }
+  #codewrap .tok {
+    cursor: pointer;
+    border-radius: 3px;
+  }
+  #codewrap .tok:hover {
+    outline: 1px dashed var(--accent);
+    outline-offset: 1px;
+  }
   #codewrap .tok.tok-hover {
     background: rgba(88, 166, 255, 0.18);
-    border-radius: 3px;
-    box-shadow: 0 0 0 1px rgba(88, 166, 255, 0.4);
-    filter: brightness(1.2);
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
   }
   #statusbar {
     position: fixed;
@@ -414,7 +439,6 @@ const PAGE = `<!DOCTYPE html>
     line-height: 1.5;
     color: var(--fg);
     box-shadow: 0 8px 24px rgba(1,4,9,0.35);
-    pointer-events: none;
     display: none;
   }
   #tooltip p { margin: 0 0 6px 0; }
@@ -436,6 +460,7 @@ const PAGE = `<!DOCTYPE html>
 <div id="menubar">
   <label for="proofSelect">Proof</label>
   <select id="proofSelect"></select>
+  <span class="spinner" id="proofSpinner" title="Elaborating…"></span>
 </div>
 <main>
   <div id="codewrap"><pre><code>loading&hellip;</code></pre></div>
@@ -453,6 +478,7 @@ const PAGE = `<!DOCTYPE html>
   var tooltip = document.getElementById('tooltip');
   var themeToggle = document.getElementById('themeToggle');
   var proofSelect = document.getElementById('proofSelect');
+  var proofSpinner = document.getElementById('proofSpinner');
 
   var lineTokMap = null; // Map<lineNumber, Element[]> of .tok spans, for range highlighting
 
@@ -537,26 +563,16 @@ const PAGE = `<!DOCTYPE html>
 
   updateThemeToggleIcon();
 
-  // --- hover interaction ---
-  // Driven entirely by real mouseover events on real .tok spans (each
-  // carrying its own data-line/data-ch), not mouse-coordinate math. This
-  // is cheaper (the browser only fires on element-enter, not every
-  // mousemove) and lets us highlight the exact hovered token(s) by
-  // toggling a class, using the range Lean's language server reports.
+  // --- click-to-reveal hover interaction ---
+  // Nothing is fetched just from moving the mouse — .tok spans only get
+  // a pointer cursor via CSS as a hint that they are clickable. Clicking a
+  // token fetches its info from Lean's language server and pins a
+  // tooltip + highlight in place; it stays until the user clicks
+  // elsewhere (outside the tooltip) or clicks a different token.
   var lastKey = null;
   var lastRange = null;
   var hoveredEls = [];
-  var hoverDebounce = null;
   var currentAbort = null;
-
-  function withinRange(line, ch, range) {
-    if (!range) return false;
-    var s = range.start, e = range.end;
-    if (line < s.line || line > e.line) return false;
-    if (line === s.line && ch < s.character) return false;
-    if (line === e.line && ch >= e.character) return false;
-    return true;
-  }
 
   function clearHighlight() {
     for (var i = 0; i < hoveredEls.length; i++) hoveredEls[i].classList.remove('tok-hover');
@@ -627,10 +643,8 @@ const PAGE = `<!DOCTYPE html>
           tooltip.style.display = 'block';
           positionTooltipNear(el);
         } else {
-          lastRange = {
-            start: { line: line, character: character },
-            end: { line: line, character: character + 1 },
-          };
+          lastRange = null;
+          lastKey = null;
           clearHighlight();
           tooltip.style.display = 'none';
         }
@@ -638,32 +652,27 @@ const PAGE = `<!DOCTYPE html>
       .catch(function () { /* aborted or server hiccup — ignore */ });
   }
 
-  function onMouseOver(e) {
-    var el = e.target.closest ? e.target.closest('.tok') : null;
-    if (!el) return;
+  document.addEventListener('click', function (e) {
+    var tokEl = e.target.closest ? e.target.closest('.tok') : null;
 
-    var line = parseInt(el.getAttribute('data-line'), 10);
-    var ch = parseInt(el.getAttribute('data-ch'), 10);
+    if (tokEl) {
+      var line = parseInt(tokEl.getAttribute('data-line'), 10);
+      var ch = parseInt(tokEl.getAttribute('data-ch'), 10);
+      var key = line + ':' + ch;
+      // Clicking the same already-open token again closes it (toggle).
+      if (key === lastKey && tooltip.style.display === 'block') {
+        hideTooltip();
+        return;
+      }
+      lastKey = key;
+      fetchHover(line, ch, tokEl);
+      return;
+    }
 
-    // Moving within the same already-resolved token (e.g. between two
-    // adjacent sub-spans Lean treats as one syntax node) — keep showing
-    // what's already there, no new request.
-    if (lastRange && withinRange(line, ch, lastRange)) return;
+    // Clicks inside the open tooltip (e.g. selecting text, clicking a
+    // link) shouldn't dismiss it.
+    if (e.target.closest && e.target.closest('#tooltip')) return;
 
-    var key = line + ':' + ch;
-    if (key === lastKey) return;
-    lastKey = key;
-
-    clearTimeout(hoverDebounce);
-    hoverDebounce = setTimeout(function () {
-      fetchHover(line, ch, el);
-    }, 80);
-  }
-
-  codewrap.addEventListener('mouseover', onMouseOver);
-  codewrap.addEventListener('mouseleave', function () {
-    clearTimeout(hoverDebounce);
-    if (currentAbort) currentAbort.abort();
     hideTooltip();
   });
 
@@ -685,12 +694,22 @@ const PAGE = `<!DOCTYPE html>
     if (currentFile) proofSelect.value = currentFile;
   }
 
+  function setSwitching(isSwitching) {
+    proofSelect.disabled = isSwitching;
+    proofSpinner.classList.toggle('active', isSwitching);
+  }
+
   proofSelect.addEventListener('change', function () {
+    // Flip to the "switching" state right away — the server pushes the new
+    // file's source over SSE immediately (before Lean has even started
+    // re-elaborating it), so the code itself shows up right away; the
+    // spinner just covers the gap until hover/diagnostics catch up.
+    setSwitching(true);
     fetch('/api/select', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id: proofSelect.value }),
-    }).catch(function () { /* SSE will reflect whatever the server ends up at */ });
+    }).catch(function () { setSwitching(false); });
   });
 
   // --- SSE live updates ---
@@ -701,6 +720,7 @@ const PAGE = `<!DOCTYPE html>
       lastData = data;
       fileEl.textContent = data.file;
       if (data.files) renderMenu(data.files, data.currentFile);
+      setSwitching(data.leanStatus === 'starting' || data.leanStatus === 'elaborating');
       renderForCurrentTheme();
       hideTooltip();
     };
