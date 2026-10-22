@@ -326,7 +326,6 @@ const PAGE = `<!DOCTYPE html>
     cursor: pointer;
   }
   #proofSelect:disabled {
-    cursor: wait;
     opacity: 0.6;
   }
   #skeleton {
