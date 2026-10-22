@@ -8,9 +8,15 @@ const { spawn } = require('child_process');
 const path = require('path');
 
 class LeanClient {
-  constructor(filePath, { onProgress, onDiagnostics, onStatus } = {}) {
+  constructor(filePath, { onProgress, onDiagnostics, onStatus, projectRoot } = {}) {
     this.filePath = path.resolve(filePath);
     this.uri = 'file://' + this.filePath;
+    // The Lake project root to run `lake serve` from — defaults to the
+    // watched file's own directory, but callers whose files live in a
+    // subdirectory of the project (e.g. lean/proofs/*.lean under the
+    // lean/ Lake project) should pass the project root explicitly, since
+    // `lake serve` looks for a lakefile in its cwd.
+    this.projectRoot = projectRoot ? path.resolve(projectRoot) : path.dirname(this.filePath);
     this.onProgress = onProgress || (() => {});
     this.onDiagnostics = onDiagnostics || (() => {});
     this.onStatus = onStatus || (() => {});
@@ -20,6 +26,7 @@ class LeanClient {
     this.proc = null;
     this.buf = Buffer.alloc(0);
     this.ready = null;
+    this._stopping = false;
   }
 
   start(initialText) {
@@ -27,8 +34,11 @@ class LeanClient {
       ...process.env,
       PATH: `${process.env.HOME}/.elan/bin:${process.env.PATH}`,
     };
-    this.proc = spawn('lean', ['--server'], {
-      cwd: path.dirname(this.filePath),
+    // Use `lake serve` (rather than bare `lean --server`) so the server
+    // picks up the enclosing Lake project's dependencies (e.g. Mathlib) —
+    // it sets up LEAN_PATH and then execs `lean --server` under the hood.
+    this.proc = spawn('lake', ['serve'], {
+      cwd: this.projectRoot,
       env,
     });
 
@@ -38,7 +48,7 @@ class LeanClient {
     });
     this.proc.on('exit', (code, signal) => {
       console.error(`lean --server exited (code=${code}, signal=${signal})`);
-      this.onStatus('crashed');
+      if (!this._stopping) this.onStatus('crashed');
       for (const { reject } of this.pending.values()) {
         reject(new Error('lean --server exited'));
       }
@@ -90,6 +100,7 @@ class LeanClient {
   }
 
   stop() {
+    this._stopping = true; // suppress the 'crashed' status from a deliberate stop
     if (this.proc) {
       try {
         this.proc.kill();

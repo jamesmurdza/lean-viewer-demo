@@ -15,19 +15,113 @@ const path = require('path');
 const { LeanClient } = require('./lspClient');
 
 const PORT = process.env.PORT || 8080;
-const LEAN_FILE = process.env.LEAN_FILE
-  ? path.resolve(process.env.LEAN_FILE)
-  : path.join(__dirname, 'lean', 'Test.lean');
+const PROOFS_DIR = process.env.LEAN_PROOFS_DIR
+  ? path.resolve(process.env.LEAN_PROOFS_DIR)
+  : path.join(__dirname, 'lean', 'proofs');
+
+// Humanize a filename like "03_real_analysis.lean" -> "Real Analysis".
+function labelFor(filename) {
+  return filename
+    .replace(/\.lean$/, '')
+    .replace(/^\d+[_-]*/, '')
+    .split(/[_-]+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+}
+
+function listProofFiles() {
+  let names = [];
+  try {
+    names = fs
+      .readdirSync(PROOFS_DIR)
+      .filter((f) => f.endsWith('.lean'))
+      .sort();
+  } catch (err) {
+    console.error(`Could not read proofs dir ${PROOFS_DIR}: ${err.message}`);
+  }
+  return names.map((name) => ({
+    id: name,
+    label: labelFor(name),
+    path: path.join(PROOFS_DIR, name),
+  }));
+}
+
+let PROOFS = listProofFiles();
+let LEAN_FILE = PROOFS.length ? PROOFS[0].path : path.join(PROOFS_DIR, 'none.lean');
+// Lake project root: the `lean/` directory containing lakefile.toml, one
+// level up from proofs/ — needed so `lake serve` can find the Mathlib
+// dependency config regardless of which proof file is open.
+const LEAN_PROJECT_ROOT = path.dirname(PROOFS_DIR);
 
 const THEMES = {
   dark: { shiki: 'github-dark-default', bg: '#0d1117', fg: '#e6edf3' },
   light: { shiki: 'github-light-default', bg: '#ffffff', fg: '#1f2328' },
 };
 
+// Shiki's bundled Lean grammar has no working rule for "--" line comments
+// (only block comments `/- ... -/` are recognized — "--" text, including
+// any keywords inside it, gets colored as plain/default code). We detect
+// "--" comments ourselves and force the correct comment color over that
+// range, overriding whatever Shiki assigned. commentColor is filled in at
+// startup by probing a (correctly-handled) block comment per theme.
+function computeLineCommentStarts(content) {
+  const lines = content.split('\n');
+  const starts = new Array(lines.length).fill(-1);
+  let inBlockComment = false;
+  let inString = false;
+  for (let li = 0; li < lines.length; li++) {
+    const line = lines[li];
+    let ch = 0;
+    while (ch < line.length) {
+      if (inBlockComment) {
+        if (line.startsWith('-/', ch)) {
+          inBlockComment = false;
+          ch += 2;
+        } else {
+          ch++;
+        }
+        continue;
+      }
+      if (inString) {
+        if (line[ch] === '\\') {
+          ch += 2;
+          continue;
+        }
+        if (line[ch] === '"') inString = false;
+        ch++;
+        continue;
+      }
+      if (line.startsWith('/-', ch)) {
+        inBlockComment = true;
+        ch += 2;
+        continue;
+      }
+      if (line[ch] === '"') {
+        inString = true;
+        ch++;
+        continue;
+      }
+      if (line.startsWith('--', ch)) {
+        starts[li] = ch;
+        break;
+      }
+      ch++;
+    }
+  }
+  return starts;
+}
+
 let clients = [];
 let highlighter = null;
 let leanStatus = 'starting'; // starting | elaborating | ready | crashed
 let diagnosticsCount = 0;
+let diagnostics = []; // full LSP diagnostics (errors, warnings, AND info — e.g. #eval/#check output)
+// Epoch ms when the current "starting"/"elaborating" run began, or null
+// when not currently checking. Sent to clients so a page that connects
+// mid-load (or just didn't have a local timer running) still knows how
+// long the *actual* run has been going, not just how long it's been open.
+let checkingStartedAt = null;
 let currentHtml = { dark: '', light: '' };
 
 function readFileSafe() {
@@ -60,14 +154,17 @@ function renderHtmlForTheme(content, themeKey) {
   }
   try {
     const lines = highlighter.codeToTokensBase(content, { lang: 'lean', theme: theme.shiki });
+    const commentStarts = computeLineCommentStarts(content);
     let body = '';
     lines.forEach((lineTokens, lineIdx) => {
       let ch = 0;
       let lineHtml = '';
+      const commentStart = commentStarts[lineIdx];
       for (const tok of lineTokens) {
-        const color = tok.color || theme.fg;
         const pieces = tok.content.match(SUBTOKEN_RE) || [tok.content];
         for (const piece of pieces) {
+          const inLineComment = commentStart !== -1 && ch >= commentStart;
+          const color = inLineComment ? theme.commentColor || theme.fg : tok.color || theme.fg;
           if (/^\s+$/.test(piece)) {
             lineHtml += escapeHtml(piece);
           } else {
@@ -76,9 +173,11 @@ function renderHtmlForTheme(content, themeKey) {
           ch += piece.length;
         }
       }
-      body += `<span class="line">${lineHtml}</span>\n`;
+      // No trailing newline here: .line is already `display: block`, so it
+      // provides its own line break. Adding a literal "\n" too (inside a
+      // whitespace-preserving <pre>) doubled every line's vertical gap.
+      body += `<span class="line">${lineHtml || '&#8203;'}</span>`;
     });
-    body = body.replace(/\n$/, '');
     return `<pre class="shiki-tok" tabindex="0"><code>${body}</code></pre>`;
   } catch (err) {
     console.error(`Shiki tokenize failed: ${err.message}`);
@@ -90,13 +189,36 @@ function renderHtml(content) {
   return { dark: renderHtmlForTheme(content, 'dark'), light: renderHtmlForTheme(content, 'light') };
 }
 
+function currentFileId() {
+  const found = PROOFS.find((p) => p.path === LEAN_FILE);
+  return found ? found.id : null;
+}
+
+// Simplified shape for the browser's output panel: just what each
+// message needs to render (line, severity, text) — LSP severity numbers
+// (1=Error, 2=Warning, 3=Information, 4=Hint), sorted top-to-bottom.
+function serializeDiagnostics() {
+  return diagnostics
+    .map((d) => ({
+      line: d.range?.start?.line ?? 0,
+      character: d.range?.start?.character ?? 0,
+      severity: d.severity ?? 3,
+      message: d.message,
+    }))
+    .sort((a, b) => a.line - b.line || a.character - b.character);
+}
+
 function sendToAll() {
   const payload = `data: ${JSON.stringify({
     htmlDark: currentHtml.dark,
     htmlLight: currentHtml.light,
     file: LEAN_FILE,
+    files: PROOFS.map((p) => ({ id: p.id, label: p.label })),
+    currentFile: currentFileId(),
     leanStatus,
     diagnosticsCount,
+    diagnostics: serializeDiagnostics(),
+    checkingStartedAt,
   })}\n\n`;
   for (const res of clients) res.write(payload);
 }
@@ -117,15 +239,26 @@ function scheduleRefresh() {
   debounceTimer = setTimeout(refresh, 100);
 }
 
+let fsWatcher = null;
+let pollInterval = null;
+
 function watchFile() {
+  if (fsWatcher) {
+    fsWatcher.close();
+    fsWatcher = null;
+  }
+  if (pollInterval) {
+    clearInterval(pollInterval);
+    pollInterval = null;
+  }
   try {
-    fs.watch(LEAN_FILE, { persistent: true }, () => scheduleRefresh());
+    fsWatcher = fs.watch(LEAN_FILE, { persistent: true }, () => scheduleRefresh());
   } catch (err) {
     console.error(`Could not watch ${LEAN_FILE}: ${err.message}`);
   }
   // Fallback poll in case fs.watch misses events (some filesystems/editors).
   let lastMtime = 0;
-  setInterval(() => {
+  pollInterval = setInterval(() => {
     try {
       const { mtimeMs } = fs.statSync(LEAN_FILE);
       if (mtimeMs !== lastMtime) {
@@ -136,6 +269,66 @@ function watchFile() {
       // ignore, file may not exist yet
     }
   }, 1000);
+}
+
+// Stop the current Lean client (if any) — used when switching files,
+// right before starting a fresh one against the new file.
+function stopLeanClient() {
+  if (leanClient) {
+    leanClient.stop();
+    leanClient = null;
+  }
+}
+
+// Start a fresh Lean client against the current LEAN_FILE/content.
+function startLeanClient(content) {
+  leanStatus = 'starting';
+  diagnosticsCount = 0;
+  diagnostics = [];
+  checkingStartedAt = Date.now();
+  const thisClient = new LeanClient(LEAN_FILE, {
+    projectRoot: LEAN_PROJECT_ROOT,
+    onStatus: (status) => {
+      if (leanClient !== thisClient) return; // stale callback from a client we've since replaced/stopped
+      leanStatus = status;
+      if (status === 'ready' || status === 'crashed') checkingStartedAt = null;
+      sendToAll();
+    },
+    onDiagnostics: (diags) => {
+      if (leanClient !== thisClient) return;
+      diagnostics = diags;
+      diagnosticsCount = diags.filter((d) => d.severity === 1 || d.severity === 2).length;
+      sendToAll();
+    },
+  });
+  leanClient = thisClient;
+  leanClient.start(content).catch((err) => {
+    if (leanClient !== thisClient) return; // we've already moved on (stopped/switched) — not a real crash
+    console.error('Failed to start Lean language server:', err);
+    leanStatus = 'crashed';
+    checkingStartedAt = null;
+    sendToAll();
+  });
+}
+
+// Switch the file being watched/elaborated — stops the current Lean
+// client and fs watcher, then starts fresh ones pointed at the new file.
+async function selectFile(fileId) {
+  const target = PROOFS.find((p) => p.id === fileId);
+  if (!target || target.path === LEAN_FILE) return;
+
+  LEAN_FILE = target.path;
+  diagnosticsCount = 0;
+  diagnostics = [];
+
+  const content = readFileSafe();
+  currentHtml = renderHtml(content);
+  stopLeanClient();
+  leanStatus = 'starting';
+  sendToAll();
+
+  startLeanClient(content);
+  watchFile();
 }
 
 const PAGE = `<!DOCTYPE html>
@@ -195,25 +388,237 @@ const PAGE = `<!DOCTYPE html>
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
     background: var(--bg);
     color: var(--fg);
+    display: flex;
+    flex-direction: column;
   }
   main {
     padding: 0;
     margin: 0 0 34px 0;
     width: 100%;
     max-width: 100%;
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  #menubar {
+    position: sticky;
+    top: 0;
+    left: 0;
+    right: 0;
+    min-height: 40px;
+    padding: 8px 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    background: var(--statusbar-bg);
+    border-bottom: 1px solid var(--border);
+    z-index: 400;
+  }
+  #menubarLeft {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  #menubarRight {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 10px;
+  }
+  #checkStatus {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 12px;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  #checkStatusDot {
+    flex: 0 0 auto;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--muted);
+  }
+  #checkStatus.status-checking #checkStatusDot {
+    background: var(--accent);
+    animation: status-pulse 1.4s ease-in-out infinite;
+  }
+  #checkStatus.status-ok #checkStatusDot { background: #3fb950; }
+  #checkStatus.status-error #checkStatusDot { background: #f85149; }
+  #checkStatus.status-crashed #checkStatusDot { background: #f85149; }
+  @keyframes status-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(88, 166, 255, 0.4); }
+    50% { box-shadow: 0 0 0 4px rgba(88, 166, 255, 0); }
+  }
+  #menubar label {
+    font-size: 12px;
+    color: var(--muted);
+  }
+  #proofSelect {
+    font-family: inherit;
+    font-size: 13px;
+    padding: 4px 8px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--btn-bg);
+    color: var(--btn-fg);
+    cursor: pointer;
+  }
+  #proofSelect:disabled {
+    opacity: 0.6;
+  }
+  #splitContainer {
+    flex: 1 1 auto;
+    display: flex;
+    min-height: 0;
+    min-width: 0;
+  }
+  #splitContainer.split-horizontal { flex-direction: column; }
+  #splitContainer.split-vertical { flex-direction: row; }
+  #codePane {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    min-width: 0;
+    overflow: hidden;
+  }
+  /* Default split sizes before the user drags the divider (persisted
+     thereafter via inline flex-basis set from JS). */
+  .split-horizontal #codePane { flex-basis: 70%; }
+  .split-vertical #codePane { flex-basis: 60%; }
+  #splitDivider {
+    flex: 0 0 6px;
+    background: var(--border);
+    position: relative;
+  }
+  .split-horizontal #splitDivider { cursor: row-resize; }
+  .split-vertical #splitDivider { cursor: col-resize; }
+  #splitDivider:hover, #splitDivider.dragging { background: var(--accent); }
+  #outputPane {
+    flex: 1 1 auto;
+    min-height: 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg);
+    overflow: hidden;
+  }
+  #outputHeader {
+    flex: 0 0 auto;
+    padding: 6px 12px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--muted);
+    border-bottom: 1px solid var(--border);
+  }
+  #outputList {
+    flex: 1 1 auto;
+    overflow: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px;
+  }
+  .output-empty {
+    padding: 10px 12px;
+    color: var(--muted);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  .output-msg {
+    display: flex;
+    gap: 8px;
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+  }
+  .output-msg:hover { background: var(--btn-bg); }
+  .output-msg .output-line {
+    flex: 0 0 auto;
+    color: var(--muted);
+    user-select: none;
+  }
+  .output-msg .output-text {
+    flex: 1 1 auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .output-msg.sev-error .output-text { color: #f85149; }
+  .output-msg.sev-warning .output-text { color: #d29922; }
+  .output-msg.sev-info .output-text { color: var(--fg); }
+  #splitToggle {
+    flex: 0 0 auto;
+    display: flex;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .split-toggle-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 24px;
+    padding: 0;
+    border: none;
+    background: var(--btn-bg);
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .split-toggle-btn svg { width: 14px; height: 14px; }
+  .split-toggle-btn:hover { color: var(--btn-fg); }
+  .split-toggle-btn + .split-toggle-btn { border-left: 1px solid var(--border); }
+  .split-toggle-btn.active {
+    background: var(--accent);
+    color: #fff;
+  }
+  #skeleton {
+    display: none;
+    padding: 18px 20px;
+  }
+  #skeleton.active { display: block; }
+  #skeleton.active + #codewrap { display: none; }
+  #skeleton .sk-line {
+    height: 14px;
+    margin: 11px 0;
+    border-radius: 4px;
+    background: linear-gradient(
+      90deg,
+      var(--border) 25%,
+      var(--btn-bg) 37%,
+      var(--border) 63%
+    );
+    background-size: 400% 100%;
+    animation: sk-shimmer 1.4s ease infinite;
+  }
+  @keyframes sk-shimmer {
+    0% { background-position: 100% 50%; }
+    100% { background-position: 0% 50%; }
   }
   #codewrap {
     width: 100%;
     max-width: 100%;
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
   }
   #codewrap pre {
     margin: 0;
     width: 100%;
     max-width: 100%;
+    flex: 1 1 auto;
+    min-height: 0;
     padding: 18px 20px;
     font-size: 14px;
     line-height: 1.6;
-    overflow-x: auto;
+    overflow: auto;
     background: var(--bg);
     color: var(--fg);
   }
@@ -236,11 +641,19 @@ const PAGE = `<!DOCTYPE html>
     color: var(--gutter);
     user-select: none;
   }
+  #codewrap .tok {
+    cursor: pointer;
+    border-radius: 3px;
+  }
+  #codewrap .tok:hover {
+    background: rgba(136, 136, 136, 0.22);
+    outline: 1px solid rgba(0, 0, 0, 0.35);
+    outline-offset: 0;
+  }
   #codewrap .tok.tok-hover {
     background: rgba(88, 166, 255, 0.18);
-    border-radius: 3px;
-    box-shadow: 0 0 0 1px rgba(88, 166, 255, 0.4);
-    filter: brightness(1.2);
+    outline: 2px solid var(--accent);
+    outline-offset: 0;
   }
   #statusbar {
     position: fixed;
@@ -259,6 +672,10 @@ const PAGE = `<!DOCTYPE html>
     z-index: 500;
   }
   #statusbar .file {
+    flex: 0 1 auto;
+    min-width: 0;
+    margin-left: auto;
+    text-align: right;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -294,7 +711,6 @@ const PAGE = `<!DOCTYPE html>
     line-height: 1.5;
     color: var(--fg);
     box-shadow: 0 8px 24px rgba(1,4,9,0.35);
-    pointer-events: none;
     display: none;
   }
   #tooltip p { margin: 0 0 6px 0; }
@@ -313,12 +729,48 @@ const PAGE = `<!DOCTYPE html>
 </style>
 </head>
 <body>
+<div id="menubar">
+  <div id="menubarLeft">
+    <label for="proofSelect">Proof</label>
+    <select id="proofSelect"></select>
+  </div>
+  <div id="menubarRight">
+    <div id="splitToggle" role="group" aria-label="Split orientation">
+      <button id="splitHorizontalBtn" class="split-toggle-btn active" title="Stack output below code">
+        <svg viewBox="0 0 16 16"><rect x="1.5" y="1.5" width="13" height="5.5" rx="1" fill="none" stroke="currentColor" stroke-width="1.4"/><rect x="1.5" y="9" width="13" height="5.5" rx="1" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
+      </button>
+      <button id="splitVerticalBtn" class="split-toggle-btn" title="Show output beside code">
+        <svg viewBox="0 0 16 16"><rect x="1.5" y="1.5" width="5.5" height="13" rx="1" fill="none" stroke="currentColor" stroke-width="1.4"/><rect x="9" y="1.5" width="5.5" height="13" rx="1" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
+      </button>
+    </div>
+    <button id="themeToggle" title="Toggle light/dark theme">&#127769;</button>
+  </div>
+</div>
 <main>
-  <div id="codewrap"><pre><code>loading&hellip;</code></pre></div>
+  <div id="splitContainer" class="split-horizontal">
+    <div id="codePane">
+      <div id="skeleton">
+        <div class="sk-line" style="width: 40%"></div>
+        <div class="sk-line" style="width: 0%"></div>
+        <div class="sk-line" style="width: 75%"></div>
+        <div class="sk-line" style="width: 58%"></div>
+        <div class="sk-line" style="width: 62%"></div>
+        <div class="sk-line" style="width: 0%"></div>
+        <div class="sk-line" style="width: 85%"></div>
+        <div class="sk-line" style="width: 45%"></div>
+      </div>
+      <div id="codewrap"><pre><code>loading&hellip;</code></pre></div>
+    </div>
+    <div id="splitDivider" title="Drag to resize"></div>
+    <div id="outputPane">
+      <div id="outputHeader">Messages</div>
+      <div id="outputList"><div class="output-empty">No output yet.</div></div>
+    </div>
+  </div>
 </main>
 <div id="statusbar">
+  <div id="checkStatus"><span id="checkStatusDot"></span><span id="checkStatusText">Starting…</span></div>
   <span class="file" id="filepath"></span>
-  <button id="themeToggle" title="Toggle light/dark theme">&#127769;</button>
 </div>
 <div id="tooltip"></div>
 
@@ -328,6 +780,16 @@ const PAGE = `<!DOCTYPE html>
   var fileEl = document.getElementById('filepath');
   var tooltip = document.getElementById('tooltip');
   var themeToggle = document.getElementById('themeToggle');
+  var proofSelect = document.getElementById('proofSelect');
+  var skeleton = document.getElementById('skeleton');
+  var checkStatus = document.getElementById('checkStatus');
+  var checkStatusText = document.getElementById('checkStatusText');
+  var splitContainer = document.getElementById('splitContainer');
+  var codePane = document.getElementById('codePane');
+  var splitDivider = document.getElementById('splitDivider');
+  var outputList = document.getElementById('outputList');
+  var splitHorizontalBtn = document.getElementById('splitHorizontalBtn');
+  var splitVerticalBtn = document.getElementById('splitVerticalBtn');
 
   var lineTokMap = null; // Map<lineNumber, Element[]> of .tok spans, for range highlighting
 
@@ -412,26 +874,16 @@ const PAGE = `<!DOCTYPE html>
 
   updateThemeToggleIcon();
 
-  // --- hover interaction ---
-  // Driven entirely by real mouseover events on real .tok spans (each
-  // carrying its own data-line/data-ch), not mouse-coordinate math. This
-  // is cheaper (the browser only fires on element-enter, not every
-  // mousemove) and lets us highlight the exact hovered token(s) by
-  // toggling a class, using the range Lean's language server reports.
+  // --- click-to-reveal hover interaction ---
+  // Nothing is fetched just from moving the mouse — .tok spans only get
+  // a pointer cursor via CSS as a hint that they are clickable. Clicking a
+  // token fetches its info from Lean's language server and pins a
+  // tooltip + highlight in place; it stays until the user clicks
+  // elsewhere (outside the tooltip) or clicks a different token.
   var lastKey = null;
   var lastRange = null;
   var hoveredEls = [];
-  var hoverDebounce = null;
   var currentAbort = null;
-
-  function withinRange(line, ch, range) {
-    if (!range) return false;
-    var s = range.start, e = range.end;
-    if (line < s.line || line > e.line) return false;
-    if (line === s.line && ch < s.character) return false;
-    if (line === e.line && ch >= e.character) return false;
-    return true;
-  }
 
   function clearHighlight() {
     for (var i = 0; i < hoveredEls.length; i++) hoveredEls[i].classList.remove('tok-hover');
@@ -502,10 +954,8 @@ const PAGE = `<!DOCTYPE html>
           tooltip.style.display = 'block';
           positionTooltipNear(el);
         } else {
-          lastRange = {
-            start: { line: line, character: character },
-            end: { line: line, character: character + 1 },
-          };
+          lastRange = null;
+          lastKey = null;
           clearHighlight();
           tooltip.style.display = 'none';
         }
@@ -513,42 +963,256 @@ const PAGE = `<!DOCTYPE html>
       .catch(function () { /* aborted or server hiccup — ignore */ });
   }
 
-  function onMouseOver(e) {
-    var el = e.target.closest ? e.target.closest('.tok') : null;
-    if (!el) return;
+  document.addEventListener('click', function (e) {
+    var tokEl = e.target.closest ? e.target.closest('.tok') : null;
 
-    var line = parseInt(el.getAttribute('data-line'), 10);
-    var ch = parseInt(el.getAttribute('data-ch'), 10);
+    if (tokEl) {
+      var line = parseInt(tokEl.getAttribute('data-line'), 10);
+      var ch = parseInt(tokEl.getAttribute('data-ch'), 10);
+      var key = line + ':' + ch;
+      // Clicking the same already-open token again closes it (toggle).
+      if (key === lastKey && tooltip.style.display === 'block') {
+        hideTooltip();
+        return;
+      }
+      lastKey = key;
+      fetchHover(line, ch, tokEl);
+      return;
+    }
 
-    // Moving within the same already-resolved token (e.g. between two
-    // adjacent sub-spans Lean treats as one syntax node) — keep showing
-    // what's already there, no new request.
-    if (lastRange && withinRange(line, ch, lastRange)) return;
+    // Clicks inside the open tooltip (e.g. selecting text, clicking a
+    // link) shouldn't dismiss it.
+    if (e.target.closest && e.target.closest('#tooltip')) return;
 
-    var key = line + ':' + ch;
-    if (key === lastKey) return;
-    lastKey = key;
-
-    clearTimeout(hoverDebounce);
-    hoverDebounce = setTimeout(function () {
-      fetchHover(line, ch, el);
-    }, 80);
-  }
-
-  codewrap.addEventListener('mouseover', onMouseOver);
-  codewrap.addEventListener('mouseleave', function () {
-    clearTimeout(hoverDebounce);
-    if (currentAbort) currentAbort.abort();
     hideTooltip();
   });
 
+  // --- proof selector menu ---
+  var lastFilesKey = null; // avoid rebuilding <option>s (and losing focus) every SSE tick
+
+  function renderMenu(files, currentFile) {
+    var key = JSON.stringify(files);
+    if (key !== lastFilesKey) {
+      lastFilesKey = key;
+      proofSelect.innerHTML = '';
+      for (var i = 0; i < files.length; i++) {
+        var opt = document.createElement('option');
+        opt.value = files[i].id;
+        opt.textContent = files[i].label;
+        proofSelect.appendChild(opt);
+      }
+    }
+    if (currentFile) proofSelect.value = currentFile;
+  }
+
+  function setSwitching(isSwitching) {
+    proofSelect.disabled = isSwitching;
+    skeleton.classList.toggle('active', isSwitching);
+  }
+
+  // --- check status indicator ---
+  // Checking runs automatically and continuously; this just reflects the
+  // live state Lean's own language server is reporting over SSE.
+  // While starting/elaborating, show elapsed time and — past a minute —
+  // call out that this is likely the one-time Mathlib environment load
+  // (which can take minutes on a cold cache), not a stuck/hung process.
+  var checkingTimer = null;
+  var checkingStartedAtMs = null;
+
+  function formatElapsed(ms) {
+    var s = Math.floor(ms / 1000);
+    if (s < 60) return s + 's';
+    return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+  }
+
+  function updateCheckingText() {
+    if (checkingStartedAtMs == null) return;
+    var elapsed = Date.now() - checkingStartedAtMs;
+    if (elapsed < 5000) {
+      checkStatusText.textContent = 'Checking…';
+    } else if (elapsed < 60000) {
+      checkStatusText.textContent = 'Checking… (' + formatElapsed(elapsed) + ')';
+    } else {
+      checkStatusText.textContent =
+        'Loading Mathlib… first run can take a few minutes (' + formatElapsed(elapsed) + ')';
+    }
+  }
+
+  function renderCheckStatus(leanStatus, diagnosticsCount, checkingStartedAt) {
+    checkStatus.classList.remove('status-checking', 'status-ok', 'status-error', 'status-crashed');
+    if (leanStatus === 'starting' || leanStatus === 'elaborating') {
+      checkStatus.classList.add('status-checking');
+      // Prefer the server's timestamp (correct even if this tab just
+      // connected mid-load) over a locally-started clock.
+      checkingStartedAtMs = checkingStartedAt || checkingStartedAtMs || Date.now();
+      updateCheckingText();
+      if (!checkingTimer) checkingTimer = setInterval(updateCheckingText, 1000);
+      return;
+    }
+    if (checkingTimer) {
+      clearInterval(checkingTimer);
+      checkingTimer = null;
+    }
+    checkingStartedAtMs = null;
+    if (leanStatus === 'crashed') {
+      checkStatus.classList.add('status-crashed');
+      checkStatusText.textContent = 'Checker crashed';
+    } else if (leanStatus === 'ready' && diagnosticsCount > 0) {
+      checkStatus.classList.add('status-error');
+      checkStatusText.textContent = diagnosticsCount === 1 ? '1 issue found' : diagnosticsCount + ' issues found';
+    } else if (leanStatus === 'ready') {
+      checkStatus.classList.add('status-ok');
+      checkStatusText.textContent = 'Checked';
+    } else {
+      checkStatusText.textContent = 'Starting…';
+    }
+  }
+
+  // --- output panel (real Lean messages: #eval/#check results, plus any
+  // error/warning text — not just the pass/fail count in the status bar) ---
+  var SEV_CLASS = { 1: 'sev-error', 2: 'sev-warning', 3: 'sev-info', 4: 'sev-info' };
+
+  function renderOutput(diags) {
+    if (!diags || diags.length === 0) {
+      outputList.innerHTML = '<div class="output-empty">No output yet.</div>';
+      return;
+    }
+    var html = '';
+    for (var i = 0; i < diags.length; i++) {
+      var d = diags[i];
+      html +=
+        '<div class="output-msg ' + (SEV_CLASS[d.severity] || 'sev-info') + '" data-line="' + d.line + '">' +
+        '<span class="output-line">L' + (d.line + 1) + '</span>' +
+        '<span class="output-text"></span>' +
+        '</div>';
+    }
+    outputList.innerHTML = html;
+    // Set text via textContent (not interpolated into the HTML string
+    // above) so message content can never be interpreted as markup.
+    var rows = outputList.querySelectorAll('.output-msg');
+    for (var j = 0; j < rows.length; j++) {
+      rows[j].querySelector('.output-text').textContent = diags[j].message;
+    }
+  }
+
+  outputList.addEventListener('click', function (e) {
+    var row = e.target.closest ? e.target.closest('.output-msg') : null;
+    if (!row || !lineTokMap) return;
+    var line = parseInt(row.getAttribute('data-line'), 10);
+    var bucket = lineTokMap.get(line);
+    if (bucket && bucket[0]) bucket[0].scrollIntoView({ block: 'center' });
+  });
+
+  // --- split layout: orientation toggle + draggable divider ---
+  var SPLIT_KEY = 'lean-viewer-split';
+  var RATIO_KEY_PREFIX = 'lean-viewer-split-ratio-';
+
+  function applyRatio(orientation) {
+    var saved = null;
+    try { saved = localStorage.getItem(RATIO_KEY_PREFIX + orientation); } catch (e) {}
+    codePane.style.flexBasis = saved ? saved + '%' : '';
+  }
+
+  function setOrientation(orientation) {
+    splitContainer.classList.remove('split-horizontal', 'split-vertical');
+    splitContainer.classList.add('split-' + orientation);
+    splitHorizontalBtn.classList.toggle('active', orientation === 'horizontal');
+    splitVerticalBtn.classList.toggle('active', orientation === 'vertical');
+    applyRatio(orientation);
+    try { localStorage.setItem(SPLIT_KEY, orientation); } catch (e) {}
+  }
+
+  splitHorizontalBtn.addEventListener('click', function () { setOrientation('horizontal'); });
+  splitVerticalBtn.addEventListener('click', function () { setOrientation('vertical'); });
+
+  (function initSplit() {
+    var saved = null;
+    try { saved = localStorage.getItem(SPLIT_KEY); } catch (e) {}
+    setOrientation(saved === 'vertical' ? 'vertical' : 'horizontal');
+  })();
+
+  (function initDrag() {
+    var dragging = false;
+
+    function orientation() {
+      return splitContainer.classList.contains('split-vertical') ? 'vertical' : 'horizontal';
+    }
+
+    function onMove(e) {
+      if (!dragging) return;
+      var rect = splitContainer.getBoundingClientRect();
+      var pct;
+      if (orientation() === 'vertical') {
+        pct = ((e.clientX - rect.left) / rect.width) * 100;
+      } else {
+        pct = ((e.clientY - rect.top) / rect.height) * 100;
+      }
+      pct = Math.max(15, Math.min(85, pct));
+      codePane.style.flexBasis = pct + '%';
+      try { localStorage.setItem(RATIO_KEY_PREFIX + orientation(), String(pct)); } catch (err) {}
+    }
+
+    function onUp() {
+      if (!dragging) return;
+      dragging = false;
+      splitDivider.classList.remove('dragging');
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    }
+
+    splitDivider.addEventListener('mousedown', function (e) {
+      dragging = true;
+      splitDivider.classList.add('dragging');
+      e.preventDefault();
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    });
+  })();
+
+  var pendingFile = null; // id we're waiting on the server to confirm/send
+
+  proofSelect.addEventListener('change', function () {
+    // Show the skeleton right away — just long enough to cover the
+    // network round trip to /api/select. The server pushes the new
+    // file's source over SSE as soon as it switches (well before Lean
+    // finishes re-elaborating it), so real code replaces the skeleton
+    // quickly; hover/diagnostics catch up separately in the background.
+    pendingFile = proofSelect.value;
+    setSwitching(true);
+    fetch('/api/select', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: proofSelect.value }),
+    }).catch(function () { pendingFile = null; setSwitching(false); });
+  });
+
   // --- SSE live updates ---
+  // The EventSource connection itself going down (server process crashed,
+  // network hiccup, etc.) is a distinct failure mode from the Lean
+  // checker crashing — surface it with the same status indicator so
+  // there's never a silently-stale page.
+  function renderOfflineStatus() {
+    checkStatus.classList.remove('status-checking', 'status-ok', 'status-error', 'status-crashed');
+    checkStatus.classList.add('status-crashed');
+    checkStatusText.textContent = 'Server offline';
+  }
+
   function connect() {
     var es = new EventSource('/events');
+    es.onerror = function () {
+      // The browser will keep retrying this connection automatically;
+      // we just reflect "offline" until a message actually gets through.
+      renderOfflineStatus();
+    };
     es.onmessage = function (e) {
       var data = JSON.parse(e.data);
       lastData = data;
       fileEl.textContent = data.file;
+      if (data.files) renderMenu(data.files, data.currentFile);
+      if (pendingFile && data.currentFile === pendingFile) pendingFile = null;
+      setSwitching(!!pendingFile);
+      renderCheckStatus(data.leanStatus, data.diagnosticsCount, data.checkingStartedAt);
+      renderOutput(data.diagnostics);
       renderForCurrentTheme();
       hideTooltip();
     };
@@ -574,12 +1238,36 @@ const server = http.createServer((req, res) => {
         htmlDark: currentHtml.dark,
         htmlLight: currentHtml.light,
         file: LEAN_FILE,
+        files: PROOFS.map((p) => ({ id: p.id, label: p.label })),
+        currentFile: currentFileId(),
         leanStatus,
         diagnosticsCount,
+        diagnostics: serializeDiagnostics(),
+        checkingStartedAt,
       })}\n\n`
     );
     req.on('close', () => {
       clients = clients.filter((c) => c !== res);
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/api/select') {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+      if (body.length > 1e4) req.destroy();
+    });
+    req.on('end', async () => {
+      try {
+        const { id } = JSON.parse(body);
+        await selectFile(id);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: err.message }));
+      }
     });
     return;
   }
@@ -626,28 +1314,24 @@ async function main() {
     langs: ['lean'],
   });
 
+  // Block comments ARE correctly recognized by the grammar, so probe one
+  // to get each theme's real "comment" scope color, used to override the
+  // (broken) "--" line-comment coloring above.
+  for (const theme of Object.values(THEMES)) {
+    const probe = highlighter.codeToTokensBase('/- x -/', { lang: 'lean', theme: theme.shiki });
+    theme.commentColor = probe[0]?.[0]?.color || theme.fg;
+  }
+
   const initialContent = readFileSafe();
   currentHtml = renderHtml(initialContent);
 
-  leanClient = new LeanClient(LEAN_FILE, {
-    onStatus: (status) => {
-      leanStatus = status;
-      sendToAll();
-    },
-    onDiagnostics: (diags) => {
-      diagnosticsCount = diags.filter((d) => d.severity === 1 || d.severity === 2).length;
-      sendToAll();
-    },
-  });
-  leanClient.start(initialContent).catch((err) => {
-    console.error('Failed to start Lean language server:', err);
-    leanStatus = 'crashed';
-  });
-
+  startLeanClient(initialContent);
   watchFile();
 
   server.listen(PORT, () => {
     console.log(`Lean live viewer running on http://localhost:${PORT}`);
+    console.log(`Proofs directory: ${PROOFS_DIR}`);
+    console.log(`Available proofs: ${PROOFS.map((p) => p.id).join(', ') || '(none found)'}`);
     console.log(`Watching file: ${LEAN_FILE}`);
   });
 }
