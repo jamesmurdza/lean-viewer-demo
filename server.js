@@ -667,8 +667,10 @@ const PAGE = `<!DOCTYPE html>
     z-index: 500;
   }
   #statusbar .file {
-    flex: 1 1 auto;
+    flex: 0 1 auto;
     min-width: 0;
+    margin-left: auto;
+    text-align: right;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     overflow: hidden;
     text-overflow: ellipsis;
