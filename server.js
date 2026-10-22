@@ -884,8 +884,23 @@ const PAGE = `<!DOCTYPE html>
   });
 
   // --- SSE live updates ---
+  // The EventSource connection itself going down (server process crashed,
+  // network hiccup, etc.) is a distinct failure mode from the Lean
+  // checker crashing — surface it with the same status indicator so
+  // there's never a silently-stale page.
+  function renderOfflineStatus() {
+    checkStatus.classList.remove('status-checking', 'status-ok', 'status-error', 'status-crashed');
+    checkStatus.classList.add('status-crashed');
+    checkStatusText.textContent = 'Server offline';
+  }
+
   function connect() {
     var es = new EventSource('/events');
+    es.onerror = function () {
+      // The browser will keep retrying this connection automatically;
+      // we just reflect "offline" until a message actually gets through.
+      renderOfflineStatus();
+    };
     es.onmessage = function (e) {
       var data = JSON.parse(e.data);
       lastData = data;
