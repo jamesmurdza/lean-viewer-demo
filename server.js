@@ -408,23 +408,23 @@ const PAGE = `<!DOCTYPE html>
     right: 0;
     height: 40px;
     padding: 0 16px;
-    display: grid;
-    grid-template-columns: 1fr auto 1fr;
+    display: flex;
     align-items: center;
+    justify-content: flex-end;
     gap: 10px;
     background: var(--statusbar-bg);
     border-bottom: 1px solid var(--border);
     z-index: 400;
   }
   #menubarRight {
-    grid-column: 3;
     display: flex;
     align-items: center;
     justify-content: flex-end;
     gap: 10px;
   }
   #checkStatus {
-    grid-column: 1;
+    flex: 1 1 auto;
+    min-width: 0;
     display: flex;
     align-items: center;
     gap: 7px;
@@ -549,21 +549,25 @@ const PAGE = `<!DOCTYPE html>
   .output-msg.sev-info .output-text { color: var(--fg); }
   #splitToggle {
     flex: 0 0 auto;
-    margin-left: 12px;
     display: flex;
     border: 1px solid var(--border);
     border-radius: 6px;
     overflow: hidden;
   }
   .split-toggle-btn {
-    font-family: inherit;
-    font-size: 11px;
-    padding: 3px 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 24px;
+    padding: 0;
     border: none;
     background: var(--btn-bg);
     color: var(--muted);
     cursor: pointer;
   }
+  .split-toggle-btn svg { width: 14px; height: 14px; }
+  .split-toggle-btn:hover { color: var(--btn-fg); }
   .split-toggle-btn + .split-toggle-btn { border-left: 1px solid var(--border); }
   .split-toggle-btn.active {
     background: var(--accent);
@@ -719,9 +723,16 @@ const PAGE = `<!DOCTYPE html>
 </head>
 <body>
 <div id="menubar">
-  <div id="checkStatus"><span id="checkStatusDot"></span><span id="checkStatusText">Starting…</span></div>
-  <span></span>
   <div id="menubarRight">
+    <div id="splitToggle" role="group" aria-label="Split orientation">
+      <button id="splitHorizontalBtn" class="split-toggle-btn active" title="Stack output below code">
+        <svg viewBox="0 0 16 16"><rect x="1.5" y="1.5" width="13" height="5.5" rx="1" fill="none" stroke="currentColor" stroke-width="1.4"/><rect x="1.5" y="9" width="13" height="5.5" rx="1" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
+      </button>
+      <button id="splitVerticalBtn" class="split-toggle-btn" title="Show output beside code">
+        <svg viewBox="0 0 16 16"><rect x="1.5" y="1.5" width="5.5" height="13" rx="1" fill="none" stroke="currentColor" stroke-width="1.4"/><rect x="9" y="1.5" width="5.5" height="13" rx="1" fill="none" stroke="currentColor" stroke-width="1.4"/></svg>
+      </button>
+    </div>
+    <button id="themeToggle" title="Toggle light/dark theme">&#127769;</button>
     <label for="proofSelect">Proof</label>
     <select id="proofSelect"></select>
   </div>
@@ -749,12 +760,8 @@ const PAGE = `<!DOCTYPE html>
   </div>
 </main>
 <div id="statusbar">
+  <div id="checkStatus"><span id="checkStatusDot"></span><span id="checkStatusText">Starting…</span></div>
   <span class="file" id="filepath"></span>
-  <div id="splitToggle" role="group" aria-label="Split orientation">
-    <button id="splitHorizontalBtn" class="split-toggle-btn active" title="Stack output below code">&#9601;&#9601;</button>
-    <button id="splitVerticalBtn" class="split-toggle-btn" title="Show output beside code">&#9614;&#9614;</button>
-  </div>
-  <button id="themeToggle" title="Toggle light/dark theme">&#127769;</button>
 </div>
 <div id="tooltip"></div>
 
