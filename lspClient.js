@@ -26,6 +26,7 @@ class LeanClient {
     this.proc = null;
     this.buf = Buffer.alloc(0);
     this.ready = null;
+    this._stopping = false;
   }
 
   start(initialText) {
@@ -47,7 +48,7 @@ class LeanClient {
     });
     this.proc.on('exit', (code, signal) => {
       console.error(`lean --server exited (code=${code}, signal=${signal})`);
-      this.onStatus('crashed');
+      if (!this._stopping) this.onStatus('crashed');
       for (const { reject } of this.pending.values()) {
         reject(new Error('lean --server exited'));
       }
@@ -99,6 +100,7 @@ class LeanClient {
   }
 
   stop() {
+    this._stopping = true; // suppress the 'crashed' status from a deliberate stop
     if (this.proc) {
       try {
         this.proc.kill();

@@ -61,9 +61,10 @@ const THEMES = {
 
 let clients = [];
 let highlighter = null;
-let leanStatus = 'starting'; // starting | elaborating | ready | crashed
+let leanStatus = 'starting'; // starting | elaborating | ready | crashed | stopped
 let diagnosticsCount = 0;
 let currentHtml = { dark: '', light: '' };
+let checkingEnabled = true; // user-toggleable via the play/stop button
 
 function readFileSafe() {
   try {
@@ -141,6 +142,7 @@ function sendToAll() {
     currentFile: currentFileId(),
     leanStatus,
     diagnosticsCount,
+    checkingEnabled,
   })}\n\n`;
   for (const res of clients) res.write(payload);
 }
@@ -193,43 +195,76 @@ function watchFile() {
   }, 1000);
 }
 
+// Stop the current Lean client (if any) — used both when switching files
+// and when the user explicitly pauses checking via the play/stop button.
+function stopLeanClient() {
+  if (leanClient) {
+    leanClient.stop();
+    leanClient = null;
+  }
+}
+
+// Start a fresh Lean client against the current LEAN_FILE/content. Only
+// does anything if the user hasn't paused checking.
+function startLeanClient(content) {
+  if (!checkingEnabled) return;
+  leanStatus = 'starting';
+  diagnosticsCount = 0;
+  const thisClient = new LeanClient(LEAN_FILE, {
+    projectRoot: LEAN_PROJECT_ROOT,
+    onStatus: (status) => {
+      if (leanClient !== thisClient) return; // stale callback from a client we've since replaced/stopped
+      leanStatus = status;
+      sendToAll();
+    },
+    onDiagnostics: (diags) => {
+      if (leanClient !== thisClient) return;
+      diagnosticsCount = diags.filter((d) => d.severity === 1 || d.severity === 2).length;
+      sendToAll();
+    },
+  });
+  leanClient = thisClient;
+  leanClient.start(content).catch((err) => {
+    if (leanClient !== thisClient) return; // we've already moved on (stopped/switched) — not a real crash
+    console.error('Failed to start Lean language server:', err);
+    leanStatus = 'crashed';
+    sendToAll();
+  });
+}
+
 // Switch the file being watched/elaborated — stops the current Lean
-// client and fs watcher, then starts fresh ones pointed at the new file.
+// client and fs watcher, then starts fresh ones pointed at the new file
+// (unless the user has paused checking, in which case it stays stopped).
 async function selectFile(fileId) {
   const target = PROOFS.find((p) => p.id === fileId);
   if (!target || target.path === LEAN_FILE) return;
 
   LEAN_FILE = target.path;
-  leanStatus = 'starting';
   diagnosticsCount = 0;
 
   const content = readFileSafe();
   currentHtml = renderHtml(content);
+  stopLeanClient();
+  leanStatus = checkingEnabled ? 'starting' : 'stopped';
   sendToAll();
 
-  if (leanClient) {
-    leanClient.stop();
-    leanClient = null;
-  }
-
-  leanClient = new LeanClient(LEAN_FILE, {
-    projectRoot: LEAN_PROJECT_ROOT,
-    onStatus: (status) => {
-      leanStatus = status;
-      sendToAll();
-    },
-    onDiagnostics: (diags) => {
-      diagnosticsCount = diags.filter((d) => d.severity === 1 || d.severity === 2).length;
-      sendToAll();
-    },
-  });
-  leanClient.start(content).catch((err) => {
-    console.error('Failed to start Lean language server:', err);
-    leanStatus = 'crashed';
-    sendToAll();
-  });
-
+  startLeanClient(content);
   watchFile();
+}
+
+// Toggle checking on/off for the currently selected file — backs the
+// play/stop button in the toolbar.
+function setChecking(enabled) {
+  checkingEnabled = enabled;
+  if (!enabled) {
+    stopLeanClient();
+    leanStatus = 'stopped';
+    diagnosticsCount = 0;
+    sendToAll();
+  } else {
+    startLeanClient(readFileSafe());
+    sendToAll();
+  }
 }
 
 const PAGE = `<!DOCTYPE html>
@@ -303,13 +338,45 @@ const PAGE = `<!DOCTYPE html>
     right: 0;
     height: 40px;
     padding: 0 16px;
-    display: flex;
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
     align-items: center;
-    justify-content: flex-end;
     gap: 10px;
     background: var(--statusbar-bg);
     border-bottom: 1px solid var(--border);
     z-index: 400;
+  }
+  #menubarRight {
+    grid-column: 3;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 10px;
+  }
+  #checkToggle {
+    grid-column: 2;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    border: 1px solid var(--border);
+    background: var(--btn-bg);
+    color: var(--btn-fg);
+    cursor: pointer;
+    padding: 0;
+  }
+  #checkToggle:hover { filter: brightness(1.2); }
+  #checkToggle svg { width: 13px; height: 13px; }
+  #checkToggle.checking {
+    border-color: var(--accent);
+    color: var(--accent);
+    animation: check-pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes check-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(88, 166, 255, 0.4); }
+    50% { box-shadow: 0 0 0 5px rgba(88, 166, 255, 0); }
   }
   #menubar label {
     font-size: 12px;
@@ -469,8 +536,15 @@ const PAGE = `<!DOCTYPE html>
 </head>
 <body>
 <div id="menubar">
-  <label for="proofSelect">Proof</label>
-  <select id="proofSelect"></select>
+  <span></span>
+  <button id="checkToggle" title="Start checking this proof">
+    <svg id="checkIconPlay" viewBox="0 0 16 16" fill="currentColor"><path d="M4 2.5v11l10-5.5-10-5.5z"/></svg>
+    <svg id="checkIconStop" viewBox="0 0 16 16" fill="currentColor" style="display:none"><rect x="3" y="3" width="10" height="10" rx="1.5"/></svg>
+  </button>
+  <div id="menubarRight">
+    <label for="proofSelect">Proof</label>
+    <select id="proofSelect"></select>
+  </div>
 </div>
 <main>
   <div id="skeleton">
@@ -499,6 +573,9 @@ const PAGE = `<!DOCTYPE html>
   var themeToggle = document.getElementById('themeToggle');
   var proofSelect = document.getElementById('proofSelect');
   var skeleton = document.getElementById('skeleton');
+  var checkToggle = document.getElementById('checkToggle');
+  var checkIconPlay = document.getElementById('checkIconPlay');
+  var checkIconStop = document.getElementById('checkIconStop');
 
   var lineTokMap = null; // Map<lineNumber, Element[]> of .tok spans, for range highlighting
 
@@ -719,6 +796,29 @@ const PAGE = `<!DOCTYPE html>
     skeleton.classList.toggle('active', isSwitching);
   }
 
+  // --- check (play/stop) toggle ---
+  // Checking runs automatically and continuously by default; this button
+  // just reflects that live status (play = idle/stopped, stop = actively
+  // elaborating) and lets the user pause/resume it.
+  function renderCheckToggle(leanStatus, checkingEnabled) {
+    var isChecking = checkingEnabled && (leanStatus === 'starting' || leanStatus === 'elaborating');
+    checkIconPlay.style.display = isChecking ? 'none' : '';
+    checkIconStop.style.display = isChecking ? '' : 'none';
+    checkToggle.classList.toggle('checking', isChecking);
+    checkToggle.title = isChecking
+      ? 'Stop checking this proof'
+      : 'Start checking this proof';
+  }
+
+  checkToggle.addEventListener('click', function () {
+    var isChecking = checkToggle.classList.contains('checking');
+    fetch('/api/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: !isChecking }),
+    }).catch(function () { /* SSE will reflect whatever the server ends up at */ });
+  });
+
   var pendingFile = null; // id we're waiting on the server to confirm/send
 
   proofSelect.addEventListener('change', function () {
@@ -746,6 +846,7 @@ const PAGE = `<!DOCTYPE html>
       if (data.files) renderMenu(data.files, data.currentFile);
       if (pendingFile && data.currentFile === pendingFile) pendingFile = null;
       setSwitching(!!pendingFile);
+      renderCheckToggle(data.leanStatus, data.checkingEnabled);
       renderForCurrentTheme();
       hideTooltip();
     };
@@ -775,6 +876,7 @@ const server = http.createServer((req, res) => {
         currentFile: currentFileId(),
         leanStatus,
         diagnosticsCount,
+        checkingEnabled,
       })}\n\n`
     );
     req.on('close', () => {
@@ -793,6 +895,26 @@ const server = http.createServer((req, res) => {
       try {
         const { id } = JSON.parse(body);
         await selectFile(id);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: err.message }));
+      }
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/api/check') {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+      if (body.length > 1e4) req.destroy();
+    });
+    req.on('end', () => {
+      try {
+        const { enabled } = JSON.parse(body);
+        setChecking(!!enabled);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
       } catch (err) {
@@ -848,22 +970,7 @@ async function main() {
   const initialContent = readFileSafe();
   currentHtml = renderHtml(initialContent);
 
-  leanClient = new LeanClient(LEAN_FILE, {
-    projectRoot: LEAN_PROJECT_ROOT,
-    onStatus: (status) => {
-      leanStatus = status;
-      sendToAll();
-    },
-    onDiagnostics: (diags) => {
-      diagnosticsCount = diags.filter((d) => d.severity === 1 || d.severity === 2).length;
-      sendToAll();
-    },
-  });
-  leanClient.start(initialContent).catch((err) => {
-    console.error('Failed to start Lean language server:', err);
-    leanStatus = 'crashed';
-  });
-
+  startLeanClient(initialContent);
   watchFile();
 
   server.listen(PORT, () => {
