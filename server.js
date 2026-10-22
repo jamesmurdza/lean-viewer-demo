@@ -116,6 +116,7 @@ let clients = [];
 let highlighter = null;
 let leanStatus = 'starting'; // starting | elaborating | ready | crashed
 let diagnosticsCount = 0;
+let diagnostics = []; // full LSP diagnostics (errors, warnings, AND info — e.g. #eval/#check output)
 let currentHtml = { dark: '', light: '' };
 
 function readFileSafe() {
@@ -188,6 +189,20 @@ function currentFileId() {
   return found ? found.id : null;
 }
 
+// Simplified shape for the browser's output panel: just what each
+// message needs to render (line, severity, text) — LSP severity numbers
+// (1=Error, 2=Warning, 3=Information, 4=Hint), sorted top-to-bottom.
+function serializeDiagnostics() {
+  return diagnostics
+    .map((d) => ({
+      line: d.range?.start?.line ?? 0,
+      character: d.range?.start?.character ?? 0,
+      severity: d.severity ?? 3,
+      message: d.message,
+    }))
+    .sort((a, b) => a.line - b.line || a.character - b.character);
+}
+
 function sendToAll() {
   const payload = `data: ${JSON.stringify({
     htmlDark: currentHtml.dark,
@@ -197,6 +212,7 @@ function sendToAll() {
     currentFile: currentFileId(),
     leanStatus,
     diagnosticsCount,
+    diagnostics: serializeDiagnostics(),
   })}\n\n`;
   for (const res of clients) res.write(payload);
 }
@@ -262,6 +278,7 @@ function stopLeanClient() {
 function startLeanClient(content) {
   leanStatus = 'starting';
   diagnosticsCount = 0;
+  diagnostics = [];
   const thisClient = new LeanClient(LEAN_FILE, {
     projectRoot: LEAN_PROJECT_ROOT,
     onStatus: (status) => {
@@ -271,6 +288,7 @@ function startLeanClient(content) {
     },
     onDiagnostics: (diags) => {
       if (leanClient !== thisClient) return;
+      diagnostics = diags;
       diagnosticsCount = diags.filter((d) => d.severity === 1 || d.severity === 2).length;
       sendToAll();
     },
@@ -292,6 +310,7 @@ async function selectFile(fileId) {
 
   LEAN_FILE = target.path;
   diagnosticsCount = 0;
+  diagnostics = [];
 
   const content = readFileSafe();
   currentHtml = renderHtml(content);
@@ -440,6 +459,107 @@ const PAGE = `<!DOCTYPE html>
   #proofSelect:disabled {
     opacity: 0.6;
   }
+  #splitContainer {
+    flex: 1 1 auto;
+    display: flex;
+    min-height: 0;
+    min-width: 0;
+  }
+  #splitContainer.split-horizontal { flex-direction: column; }
+  #splitContainer.split-vertical { flex-direction: row; }
+  #codePane {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    min-width: 0;
+    overflow: hidden;
+  }
+  /* Default split sizes before the user drags the divider (persisted
+     thereafter via inline flex-basis set from JS). */
+  .split-horizontal #codePane { flex-basis: 70%; }
+  .split-vertical #codePane { flex-basis: 60%; }
+  #splitDivider {
+    flex: 0 0 6px;
+    background: var(--border);
+    position: relative;
+  }
+  .split-horizontal #splitDivider { cursor: row-resize; }
+  .split-vertical #splitDivider { cursor: col-resize; }
+  #splitDivider:hover, #splitDivider.dragging { background: var(--accent); }
+  #outputPane {
+    flex: 1 1 auto;
+    min-height: 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg);
+    overflow: hidden;
+  }
+  #outputHeader {
+    flex: 0 0 auto;
+    padding: 6px 12px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--muted);
+    border-bottom: 1px solid var(--border);
+  }
+  #outputList {
+    flex: 1 1 auto;
+    overflow: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px;
+  }
+  .output-empty {
+    padding: 10px 12px;
+    color: var(--muted);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  .output-msg {
+    display: flex;
+    gap: 8px;
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+  }
+  .output-msg:hover { background: var(--btn-bg); }
+  .output-msg .output-line {
+    flex: 0 0 auto;
+    color: var(--muted);
+    user-select: none;
+  }
+  .output-msg .output-text {
+    flex: 1 1 auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .output-msg.sev-error .output-text { color: #f85149; }
+  .output-msg.sev-warning .output-text { color: #d29922; }
+  .output-msg.sev-info .output-text { color: var(--fg); }
+  #splitToggle {
+    flex: 0 0 auto;
+    margin-left: 12px;
+    display: flex;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .split-toggle-btn {
+    font-family: inherit;
+    font-size: 11px;
+    padding: 3px 8px;
+    border: none;
+    background: var(--btn-bg);
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .split-toggle-btn + .split-toggle-btn { border-left: 1px solid var(--border); }
+  .split-toggle-btn.active {
+    background: var(--accent);
+    color: #fff;
+  }
   #skeleton {
     display: none;
     padding: 18px 20px;
@@ -534,6 +654,8 @@ const PAGE = `<!DOCTYPE html>
     z-index: 500;
   }
   #statusbar .file {
+    flex: 1 1 auto;
+    min-width: 0;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -596,20 +718,33 @@ const PAGE = `<!DOCTYPE html>
   </div>
 </div>
 <main>
-  <div id="skeleton">
-    <div class="sk-line" style="width: 40%"></div>
-    <div class="sk-line" style="width: 0%"></div>
-    <div class="sk-line" style="width: 75%"></div>
-    <div class="sk-line" style="width: 58%"></div>
-    <div class="sk-line" style="width: 62%"></div>
-    <div class="sk-line" style="width: 0%"></div>
-    <div class="sk-line" style="width: 85%"></div>
-    <div class="sk-line" style="width: 45%"></div>
+  <div id="splitContainer" class="split-horizontal">
+    <div id="codePane">
+      <div id="skeleton">
+        <div class="sk-line" style="width: 40%"></div>
+        <div class="sk-line" style="width: 0%"></div>
+        <div class="sk-line" style="width: 75%"></div>
+        <div class="sk-line" style="width: 58%"></div>
+        <div class="sk-line" style="width: 62%"></div>
+        <div class="sk-line" style="width: 0%"></div>
+        <div class="sk-line" style="width: 85%"></div>
+        <div class="sk-line" style="width: 45%"></div>
+      </div>
+      <div id="codewrap"><pre><code>loading&hellip;</code></pre></div>
+    </div>
+    <div id="splitDivider" title="Drag to resize"></div>
+    <div id="outputPane">
+      <div id="outputHeader">Messages</div>
+      <div id="outputList"><div class="output-empty">No output yet.</div></div>
+    </div>
   </div>
-  <div id="codewrap"><pre><code>loading&hellip;</code></pre></div>
 </main>
 <div id="statusbar">
   <span class="file" id="filepath"></span>
+  <div id="splitToggle" role="group" aria-label="Split orientation">
+    <button id="splitHorizontalBtn" class="split-toggle-btn active" title="Stack output below code">&#9601;&#9601;</button>
+    <button id="splitVerticalBtn" class="split-toggle-btn" title="Show output beside code">&#9614;&#9614;</button>
+  </div>
   <button id="themeToggle" title="Toggle light/dark theme">&#127769;</button>
 </div>
 <div id="tooltip"></div>
@@ -624,6 +759,12 @@ const PAGE = `<!DOCTYPE html>
   var skeleton = document.getElementById('skeleton');
   var checkStatus = document.getElementById('checkStatus');
   var checkStatusText = document.getElementById('checkStatusText');
+  var splitContainer = document.getElementById('splitContainer');
+  var codePane = document.getElementById('codePane');
+  var splitDivider = document.getElementById('splitDivider');
+  var outputList = document.getElementById('outputList');
+  var splitHorizontalBtn = document.getElementById('splitHorizontalBtn');
+  var splitVerticalBtn = document.getElementById('splitVerticalBtn');
 
   var lineTokMap = null; // Map<lineNumber, Element[]> of .tok spans, for range highlighting
 
@@ -866,6 +1007,107 @@ const PAGE = `<!DOCTYPE html>
     }
   }
 
+  // --- output panel (real Lean messages: #eval/#check results, plus any
+  // error/warning text — not just the pass/fail count in the status bar) ---
+  var SEV_CLASS = { 1: 'sev-error', 2: 'sev-warning', 3: 'sev-info', 4: 'sev-info' };
+
+  function renderOutput(diags) {
+    if (!diags || diags.length === 0) {
+      outputList.innerHTML = '<div class="output-empty">No output yet.</div>';
+      return;
+    }
+    var html = '';
+    for (var i = 0; i < diags.length; i++) {
+      var d = diags[i];
+      html +=
+        '<div class="output-msg ' + (SEV_CLASS[d.severity] || 'sev-info') + '" data-line="' + d.line + '">' +
+        '<span class="output-line">L' + (d.line + 1) + '</span>' +
+        '<span class="output-text"></span>' +
+        '</div>';
+    }
+    outputList.innerHTML = html;
+    // Set text via textContent (not interpolated into the HTML string
+    // above) so message content can never be interpreted as markup.
+    var rows = outputList.querySelectorAll('.output-msg');
+    for (var j = 0; j < rows.length; j++) {
+      rows[j].querySelector('.output-text').textContent = diags[j].message;
+    }
+  }
+
+  outputList.addEventListener('click', function (e) {
+    var row = e.target.closest ? e.target.closest('.output-msg') : null;
+    if (!row || !lineTokMap) return;
+    var line = parseInt(row.getAttribute('data-line'), 10);
+    var bucket = lineTokMap.get(line);
+    if (bucket && bucket[0]) bucket[0].scrollIntoView({ block: 'center' });
+  });
+
+  // --- split layout: orientation toggle + draggable divider ---
+  var SPLIT_KEY = 'lean-viewer-split';
+  var RATIO_KEY_PREFIX = 'lean-viewer-split-ratio-';
+
+  function applyRatio(orientation) {
+    var saved = null;
+    try { saved = localStorage.getItem(RATIO_KEY_PREFIX + orientation); } catch (e) {}
+    codePane.style.flexBasis = saved ? saved + '%' : '';
+  }
+
+  function setOrientation(orientation) {
+    splitContainer.classList.remove('split-horizontal', 'split-vertical');
+    splitContainer.classList.add('split-' + orientation);
+    splitHorizontalBtn.classList.toggle('active', orientation === 'horizontal');
+    splitVerticalBtn.classList.toggle('active', orientation === 'vertical');
+    applyRatio(orientation);
+    try { localStorage.setItem(SPLIT_KEY, orientation); } catch (e) {}
+  }
+
+  splitHorizontalBtn.addEventListener('click', function () { setOrientation('horizontal'); });
+  splitVerticalBtn.addEventListener('click', function () { setOrientation('vertical'); });
+
+  (function initSplit() {
+    var saved = null;
+    try { saved = localStorage.getItem(SPLIT_KEY); } catch (e) {}
+    setOrientation(saved === 'vertical' ? 'vertical' : 'horizontal');
+  })();
+
+  (function initDrag() {
+    var dragging = false;
+
+    function orientation() {
+      return splitContainer.classList.contains('split-vertical') ? 'vertical' : 'horizontal';
+    }
+
+    function onMove(e) {
+      if (!dragging) return;
+      var rect = splitContainer.getBoundingClientRect();
+      var pct;
+      if (orientation() === 'vertical') {
+        pct = ((e.clientX - rect.left) / rect.width) * 100;
+      } else {
+        pct = ((e.clientY - rect.top) / rect.height) * 100;
+      }
+      pct = Math.max(15, Math.min(85, pct));
+      codePane.style.flexBasis = pct + '%';
+      try { localStorage.setItem(RATIO_KEY_PREFIX + orientation(), String(pct)); } catch (err) {}
+    }
+
+    function onUp() {
+      if (!dragging) return;
+      dragging = false;
+      splitDivider.classList.remove('dragging');
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    }
+
+    splitDivider.addEventListener('mousedown', function (e) {
+      dragging = true;
+      splitDivider.classList.add('dragging');
+      e.preventDefault();
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    });
+  })();
+
   var pendingFile = null; // id we're waiting on the server to confirm/send
 
   proofSelect.addEventListener('change', function () {
@@ -909,6 +1151,7 @@ const PAGE = `<!DOCTYPE html>
       if (pendingFile && data.currentFile === pendingFile) pendingFile = null;
       setSwitching(!!pendingFile);
       renderCheckStatus(data.leanStatus, data.diagnosticsCount);
+      renderOutput(data.diagnostics);
       renderForCurrentTheme();
       hideTooltip();
     };
@@ -938,6 +1181,7 @@ const server = http.createServer((req, res) => {
         currentFile: currentFileId(),
         leanStatus,
         diagnosticsCount,
+        diagnostics: serializeDiagnostics(),
       })}\n\n`
     );
     req.on('close', () => {
