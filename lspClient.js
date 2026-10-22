@@ -27,7 +27,10 @@ class LeanClient {
       ...process.env,
       PATH: `${process.env.HOME}/.elan/bin:${process.env.PATH}`,
     };
-    this.proc = spawn('lean', ['--server'], {
+    // Use `lake serve` (rather than bare `lean --server`) so the server
+    // picks up the enclosing Lake project's dependencies (e.g. Mathlib) —
+    // it sets up LEAN_PATH and then execs `lean --server` under the hood.
+    this.proc = spawn('lake', ['serve'], {
       cwd: path.dirname(this.filePath),
       env,
     });
