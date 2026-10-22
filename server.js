@@ -117,6 +117,11 @@ let highlighter = null;
 let leanStatus = 'starting'; // starting | elaborating | ready | crashed
 let diagnosticsCount = 0;
 let diagnostics = []; // full LSP diagnostics (errors, warnings, AND info — e.g. #eval/#check output)
+// Epoch ms when the current "starting"/"elaborating" run began, or null
+// when not currently checking. Sent to clients so a page that connects
+// mid-load (or just didn't have a local timer running) still knows how
+// long the *actual* run has been going, not just how long it's been open.
+let checkingStartedAt = null;
 let currentHtml = { dark: '', light: '' };
 
 function readFileSafe() {
@@ -213,6 +218,7 @@ function sendToAll() {
     leanStatus,
     diagnosticsCount,
     diagnostics: serializeDiagnostics(),
+    checkingStartedAt,
   })}\n\n`;
   for (const res of clients) res.write(payload);
 }
@@ -279,11 +285,13 @@ function startLeanClient(content) {
   leanStatus = 'starting';
   diagnosticsCount = 0;
   diagnostics = [];
+  checkingStartedAt = Date.now();
   const thisClient = new LeanClient(LEAN_FILE, {
     projectRoot: LEAN_PROJECT_ROOT,
     onStatus: (status) => {
       if (leanClient !== thisClient) return; // stale callback from a client we've since replaced/stopped
       leanStatus = status;
+      if (status === 'ready' || status === 'crashed') checkingStartedAt = null;
       sendToAll();
     },
     onDiagnostics: (diags) => {
@@ -298,6 +306,7 @@ function startLeanClient(content) {
     if (leanClient !== thisClient) return; // we've already moved on (stopped/switched) — not a real crash
     console.error('Failed to start Lean language server:', err);
     leanStatus = 'crashed';
+    checkingStartedAt = null;
     sendToAll();
   });
 }
@@ -988,12 +997,48 @@ const PAGE = `<!DOCTYPE html>
   // --- check status indicator ---
   // Checking runs automatically and continuously; this just reflects the
   // live state Lean's own language server is reporting over SSE.
-  function renderCheckStatus(leanStatus, diagnosticsCount) {
+  // While starting/elaborating, show elapsed time and — past a minute —
+  // call out that this is likely the one-time Mathlib environment load
+  // (which can take minutes on a cold cache), not a stuck/hung process.
+  var checkingTimer = null;
+  var checkingStartedAtMs = null;
+
+  function formatElapsed(ms) {
+    var s = Math.floor(ms / 1000);
+    if (s < 60) return s + 's';
+    return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+  }
+
+  function updateCheckingText() {
+    if (checkingStartedAtMs == null) return;
+    var elapsed = Date.now() - checkingStartedAtMs;
+    if (elapsed < 5000) {
+      checkStatusText.textContent = 'Checking…';
+    } else if (elapsed < 60000) {
+      checkStatusText.textContent = 'Checking… (' + formatElapsed(elapsed) + ')';
+    } else {
+      checkStatusText.textContent =
+        'Loading Mathlib… first run can take a few minutes (' + formatElapsed(elapsed) + ')';
+    }
+  }
+
+  function renderCheckStatus(leanStatus, diagnosticsCount, checkingStartedAt) {
     checkStatus.classList.remove('status-checking', 'status-ok', 'status-error', 'status-crashed');
     if (leanStatus === 'starting' || leanStatus === 'elaborating') {
       checkStatus.classList.add('status-checking');
-      checkStatusText.textContent = 'Checking…';
-    } else if (leanStatus === 'crashed') {
+      // Prefer the server's timestamp (correct even if this tab just
+      // connected mid-load) over a locally-started clock.
+      checkingStartedAtMs = checkingStartedAt || checkingStartedAtMs || Date.now();
+      updateCheckingText();
+      if (!checkingTimer) checkingTimer = setInterval(updateCheckingText, 1000);
+      return;
+    }
+    if (checkingTimer) {
+      clearInterval(checkingTimer);
+      checkingTimer = null;
+    }
+    checkingStartedAtMs = null;
+    if (leanStatus === 'crashed') {
       checkStatus.classList.add('status-crashed');
       checkStatusText.textContent = 'Checker crashed';
     } else if (leanStatus === 'ready' && diagnosticsCount > 0) {
@@ -1150,7 +1195,7 @@ const PAGE = `<!DOCTYPE html>
       if (data.files) renderMenu(data.files, data.currentFile);
       if (pendingFile && data.currentFile === pendingFile) pendingFile = null;
       setSwitching(!!pendingFile);
-      renderCheckStatus(data.leanStatus, data.diagnosticsCount);
+      renderCheckStatus(data.leanStatus, data.diagnosticsCount, data.checkingStartedAt);
       renderOutput(data.diagnostics);
       renderForCurrentTheme();
       hideTooltip();
@@ -1182,6 +1227,7 @@ const server = http.createServer((req, res) => {
         leanStatus,
         diagnosticsCount,
         diagnostics: serializeDiagnostics(),
+        checkingStartedAt,
       })}\n\n`
     );
     req.on('close', () => {
