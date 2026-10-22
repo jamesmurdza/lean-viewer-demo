@@ -324,12 +324,18 @@ const PAGE = `<!DOCTYPE html>
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
     background: var(--bg);
     color: var(--fg);
+    display: flex;
+    flex-direction: column;
   }
   main {
     padding: 0;
     margin: 0 0 34px 0;
     width: 100%;
     max-width: 100%;
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
   }
   #menubar {
     position: sticky;
@@ -421,15 +427,21 @@ const PAGE = `<!DOCTYPE html>
   #codewrap {
     width: 100%;
     max-width: 100%;
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
   }
   #codewrap pre {
     margin: 0;
     width: 100%;
     max-width: 100%;
+    flex: 1 1 auto;
+    min-height: 0;
     padding: 18px 20px;
     font-size: 14px;
     line-height: 1.6;
-    overflow-x: auto;
+    overflow: auto;
     background: var(--bg);
     color: var(--fg);
   }
@@ -457,13 +469,14 @@ const PAGE = `<!DOCTYPE html>
     border-radius: 3px;
   }
   #codewrap .tok:hover {
-    outline: 1px dashed var(--accent);
-    outline-offset: 1px;
+    background: rgba(136, 136, 136, 0.22);
+    outline: 1px solid rgba(0, 0, 0, 0.35);
+    outline-offset: 0;
   }
   #codewrap .tok.tok-hover {
     background: rgba(88, 166, 255, 0.18);
     outline: 2px solid var(--accent);
-    outline-offset: 1px;
+    outline-offset: 0;
   }
   #statusbar {
     position: fixed;
