@@ -144,6 +144,15 @@ the cost of `lean --server` loading all of Mathlib's `.olean` files into
 memory for the first file that imports it — it happens once per server
 process (e.g. once per `npm start`/restart), not per edit. Once `"ready"`,
 subsequent edits to the watched file get diagnostics much faster since the
-environment is already loaded. If you restart the Node server, expect
-hover info and diagnostics to be unavailable/stale for several minutes
-while it re-elaborates.
+environment is already loaded.
+
+**This is disk I/O, not CPU** — the first cold run showed ~3s of user CPU
+time vs. ~66s of sys time (`time lake env lean ...`), i.e. almost all the
+wait was the kernel reading thousands of `.olean` files off disk for the
+first time. Once read, those files sit in the OS page cache (`free -h`
+shows tens of GB in `buff/cache`). So **restarting the `node server.js` /
+`lake serve` process alone is fast** (well under a minute) as long as the
+underlying sandbox/VM keeps running, because Mathlib's files are still
+warm in page cache from the earlier run. The slow ~7–8 minute path only
+recurs after something clears that cache — a full sandbox/VM reboot, not
+just an app restart.
