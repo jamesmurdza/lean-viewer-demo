@@ -114,10 +114,9 @@ function computeLineCommentStarts(content) {
 
 let clients = [];
 let highlighter = null;
-let leanStatus = 'starting'; // starting | elaborating | ready | crashed | stopped
+let leanStatus = 'starting'; // starting | elaborating | ready | crashed
 let diagnosticsCount = 0;
 let currentHtml = { dark: '', light: '' };
-let checkingEnabled = true; // user-toggleable via the play/stop button
 
 function readFileSafe() {
   try {
@@ -198,7 +197,6 @@ function sendToAll() {
     currentFile: currentFileId(),
     leanStatus,
     diagnosticsCount,
-    checkingEnabled,
   })}\n\n`;
   for (const res of clients) res.write(payload);
 }
@@ -251,8 +249,8 @@ function watchFile() {
   }, 1000);
 }
 
-// Stop the current Lean client (if any) — used both when switching files
-// and when the user explicitly pauses checking via the play/stop button.
+// Stop the current Lean client (if any) — used when switching files,
+// right before starting a fresh one against the new file.
 function stopLeanClient() {
   if (leanClient) {
     leanClient.stop();
@@ -260,10 +258,8 @@ function stopLeanClient() {
   }
 }
 
-// Start a fresh Lean client against the current LEAN_FILE/content. Only
-// does anything if the user hasn't paused checking.
+// Start a fresh Lean client against the current LEAN_FILE/content.
 function startLeanClient(content) {
-  if (!checkingEnabled) return;
   leanStatus = 'starting';
   diagnosticsCount = 0;
   const thisClient = new LeanClient(LEAN_FILE, {
@@ -289,8 +285,7 @@ function startLeanClient(content) {
 }
 
 // Switch the file being watched/elaborated — stops the current Lean
-// client and fs watcher, then starts fresh ones pointed at the new file
-// (unless the user has paused checking, in which case it stays stopped).
+// client and fs watcher, then starts fresh ones pointed at the new file.
 async function selectFile(fileId) {
   const target = PROOFS.find((p) => p.id === fileId);
   if (!target || target.path === LEAN_FILE) return;
@@ -301,26 +296,11 @@ async function selectFile(fileId) {
   const content = readFileSafe();
   currentHtml = renderHtml(content);
   stopLeanClient();
-  leanStatus = checkingEnabled ? 'starting' : 'stopped';
+  leanStatus = 'starting';
   sendToAll();
 
   startLeanClient(content);
   watchFile();
-}
-
-// Toggle checking on/off for the currently selected file — backs the
-// play/stop button in the toolbar.
-function setChecking(enabled) {
-  checkingEnabled = enabled;
-  if (!enabled) {
-    stopLeanClient();
-    leanStatus = 'stopped';
-    diagnosticsCount = 0;
-    sendToAll();
-  } else {
-    startLeanClient(readFileSafe());
-    sendToAll();
-  }
 }
 
 const PAGE = `<!DOCTYPE html>
@@ -415,30 +395,33 @@ const PAGE = `<!DOCTYPE html>
     justify-content: flex-end;
     gap: 10px;
   }
-  #checkToggle {
-    grid-column: 2;
-    width: 28px;
-    height: 28px;
+  #checkStatus {
+    grid-column: 1;
     display: flex;
     align-items: center;
-    justify-content: center;
+    gap: 7px;
+    font-size: 12px;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  #checkStatusDot {
+    flex: 0 0 auto;
+    width: 8px;
+    height: 8px;
     border-radius: 50%;
-    border: 1px solid var(--border);
-    background: var(--btn-bg);
-    color: var(--btn-fg);
-    cursor: pointer;
-    padding: 0;
+    background: var(--muted);
   }
-  #checkToggle:hover { filter: brightness(1.2); }
-  #checkToggle svg { width: 13px; height: 13px; }
-  #checkToggle.checking {
-    border-color: var(--accent);
-    color: var(--accent);
-    animation: check-pulse 1.4s ease-in-out infinite;
+  #checkStatus.status-checking #checkStatusDot {
+    background: var(--accent);
+    animation: status-pulse 1.4s ease-in-out infinite;
   }
-  @keyframes check-pulse {
+  #checkStatus.status-ok #checkStatusDot { background: #3fb950; }
+  #checkStatus.status-error #checkStatusDot { background: #f85149; }
+  #checkStatus.status-crashed #checkStatusDot { background: #f85149; }
+  @keyframes status-pulse {
     0%, 100% { box-shadow: 0 0 0 0 rgba(88, 166, 255, 0.4); }
-    50% { box-shadow: 0 0 0 5px rgba(88, 166, 255, 0); }
+    50% { box-shadow: 0 0 0 4px rgba(88, 166, 255, 0); }
   }
   #menubar label {
     font-size: 12px;
@@ -605,11 +588,8 @@ const PAGE = `<!DOCTYPE html>
 </head>
 <body>
 <div id="menubar">
+  <div id="checkStatus"><span id="checkStatusDot"></span><span id="checkStatusText">Starting…</span></div>
   <span></span>
-  <button id="checkToggle" title="Start checking this proof">
-    <svg id="checkIconPlay" viewBox="0 0 16 16" fill="currentColor"><path d="M4 2.5v11l10-5.5-10-5.5z"/></svg>
-    <svg id="checkIconStop" viewBox="0 0 16 16" fill="currentColor" style="display:none"><rect x="3" y="3" width="10" height="10" rx="1.5"/></svg>
-  </button>
   <div id="menubarRight">
     <label for="proofSelect">Proof</label>
     <select id="proofSelect"></select>
@@ -642,9 +622,8 @@ const PAGE = `<!DOCTYPE html>
   var themeToggle = document.getElementById('themeToggle');
   var proofSelect = document.getElementById('proofSelect');
   var skeleton = document.getElementById('skeleton');
-  var checkToggle = document.getElementById('checkToggle');
-  var checkIconPlay = document.getElementById('checkIconPlay');
-  var checkIconStop = document.getElementById('checkIconStop');
+  var checkStatus = document.getElementById('checkStatus');
+  var checkStatusText = document.getElementById('checkStatusText');
 
   var lineTokMap = null; // Map<lineNumber, Element[]> of .tok spans, for range highlighting
 
@@ -865,28 +844,27 @@ const PAGE = `<!DOCTYPE html>
     skeleton.classList.toggle('active', isSwitching);
   }
 
-  // --- check (play/stop) toggle ---
-  // Checking runs automatically and continuously by default; this button
-  // just reflects that live status (play = idle/stopped, stop = actively
-  // elaborating) and lets the user pause/resume it.
-  function renderCheckToggle(leanStatus, checkingEnabled) {
-    var isChecking = checkingEnabled && (leanStatus === 'starting' || leanStatus === 'elaborating');
-    checkIconPlay.style.display = isChecking ? 'none' : '';
-    checkIconStop.style.display = isChecking ? '' : 'none';
-    checkToggle.classList.toggle('checking', isChecking);
-    checkToggle.title = isChecking
-      ? 'Stop checking this proof'
-      : 'Start checking this proof';
+  // --- check status indicator ---
+  // Checking runs automatically and continuously; this just reflects the
+  // live state Lean's own language server is reporting over SSE.
+  function renderCheckStatus(leanStatus, diagnosticsCount) {
+    checkStatus.classList.remove('status-checking', 'status-ok', 'status-error', 'status-crashed');
+    if (leanStatus === 'starting' || leanStatus === 'elaborating') {
+      checkStatus.classList.add('status-checking');
+      checkStatusText.textContent = 'Checking…';
+    } else if (leanStatus === 'crashed') {
+      checkStatus.classList.add('status-crashed');
+      checkStatusText.textContent = 'Checker crashed';
+    } else if (leanStatus === 'ready' && diagnosticsCount > 0) {
+      checkStatus.classList.add('status-error');
+      checkStatusText.textContent = diagnosticsCount === 1 ? '1 issue found' : diagnosticsCount + ' issues found';
+    } else if (leanStatus === 'ready') {
+      checkStatus.classList.add('status-ok');
+      checkStatusText.textContent = 'Checked';
+    } else {
+      checkStatusText.textContent = 'Starting…';
+    }
   }
-
-  checkToggle.addEventListener('click', function () {
-    var isChecking = checkToggle.classList.contains('checking');
-    fetch('/api/check', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled: !isChecking }),
-    }).catch(function () { /* SSE will reflect whatever the server ends up at */ });
-  });
 
   var pendingFile = null; // id we're waiting on the server to confirm/send
 
@@ -915,7 +893,7 @@ const PAGE = `<!DOCTYPE html>
       if (data.files) renderMenu(data.files, data.currentFile);
       if (pendingFile && data.currentFile === pendingFile) pendingFile = null;
       setSwitching(!!pendingFile);
-      renderCheckToggle(data.leanStatus, data.checkingEnabled);
+      renderCheckStatus(data.leanStatus, data.diagnosticsCount);
       renderForCurrentTheme();
       hideTooltip();
     };
@@ -945,7 +923,6 @@ const server = http.createServer((req, res) => {
         currentFile: currentFileId(),
         leanStatus,
         diagnosticsCount,
-        checkingEnabled,
       })}\n\n`
     );
     req.on('close', () => {
@@ -964,26 +941,6 @@ const server = http.createServer((req, res) => {
       try {
         const { id } = JSON.parse(body);
         await selectFile(id);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true }));
-      } catch (err) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: err.message }));
-      }
-    });
-    return;
-  }
-
-  if (req.method === 'POST' && req.url === '/api/check') {
-    let body = '';
-    req.on('data', (chunk) => {
-      body += chunk;
-      if (body.length > 1e4) req.destroy();
-    });
-    req.on('end', () => {
-      try {
-        const { enabled } = JSON.parse(body);
-        setChecking(!!enabled);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
       } catch (err) {
