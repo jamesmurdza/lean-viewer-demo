@@ -410,11 +410,16 @@ const PAGE = `<!DOCTYPE html>
     padding: 0 16px;
     display: flex;
     align-items: center;
-    justify-content: flex-end;
+    justify-content: space-between;
     gap: 10px;
     background: var(--statusbar-bg);
     border-bottom: 1px solid var(--border);
     z-index: 400;
+  }
+  #menubarLeft {
+    display: flex;
+    align-items: center;
+    gap: 10px;
   }
   #menubarRight {
     display: flex;
@@ -725,6 +730,10 @@ const PAGE = `<!DOCTYPE html>
 </head>
 <body>
 <div id="menubar">
+  <div id="menubarLeft">
+    <label for="proofSelect">Proof</label>
+    <select id="proofSelect"></select>
+  </div>
   <div id="menubarRight">
     <div id="splitToggle" role="group" aria-label="Split orientation">
       <button id="splitHorizontalBtn" class="split-toggle-btn active" title="Stack output below code">
@@ -735,8 +744,6 @@ const PAGE = `<!DOCTYPE html>
       </button>
     </div>
     <button id="themeToggle" title="Toggle light/dark theme">&#127769;</button>
-    <label for="proofSelect">Proof</label>
-    <select id="proofSelect"></select>
   </div>
 </div>
 <main>
