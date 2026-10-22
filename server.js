@@ -15,9 +15,44 @@ const path = require('path');
 const { LeanClient } = require('./lspClient');
 
 const PORT = process.env.PORT || 8080;
-const LEAN_FILE = process.env.LEAN_FILE
-  ? path.resolve(process.env.LEAN_FILE)
-  : path.join(__dirname, 'lean', 'Test.lean');
+const PROOFS_DIR = process.env.LEAN_PROOFS_DIR
+  ? path.resolve(process.env.LEAN_PROOFS_DIR)
+  : path.join(__dirname, 'lean', 'proofs');
+
+// Humanize a filename like "03_real_analysis.lean" -> "Real Analysis".
+function labelFor(filename) {
+  return filename
+    .replace(/\.lean$/, '')
+    .replace(/^\d+[_-]*/, '')
+    .split(/[_-]+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+}
+
+function listProofFiles() {
+  let names = [];
+  try {
+    names = fs
+      .readdirSync(PROOFS_DIR)
+      .filter((f) => f.endsWith('.lean'))
+      .sort();
+  } catch (err) {
+    console.error(`Could not read proofs dir ${PROOFS_DIR}: ${err.message}`);
+  }
+  return names.map((name) => ({
+    id: name,
+    label: labelFor(name),
+    path: path.join(PROOFS_DIR, name),
+  }));
+}
+
+let PROOFS = listProofFiles();
+let LEAN_FILE = PROOFS.length ? PROOFS[0].path : path.join(PROOFS_DIR, 'none.lean');
+// Lake project root: the `lean/` directory containing lakefile.toml, one
+// level up from proofs/ — needed so `lake serve` can find the Mathlib
+// dependency config regardless of which proof file is open.
+const LEAN_PROJECT_ROOT = path.dirname(PROOFS_DIR);
 
 const THEMES = {
   dark: { shiki: 'github-dark-default', bg: '#0d1117', fg: '#e6edf3' },
@@ -90,11 +125,18 @@ function renderHtml(content) {
   return { dark: renderHtmlForTheme(content, 'dark'), light: renderHtmlForTheme(content, 'light') };
 }
 
+function currentFileId() {
+  const found = PROOFS.find((p) => p.path === LEAN_FILE);
+  return found ? found.id : null;
+}
+
 function sendToAll() {
   const payload = `data: ${JSON.stringify({
     htmlDark: currentHtml.dark,
     htmlLight: currentHtml.light,
     file: LEAN_FILE,
+    files: PROOFS.map((p) => ({ id: p.id, label: p.label })),
+    currentFile: currentFileId(),
     leanStatus,
     diagnosticsCount,
   })}\n\n`;
@@ -117,15 +159,26 @@ function scheduleRefresh() {
   debounceTimer = setTimeout(refresh, 100);
 }
 
+let fsWatcher = null;
+let pollInterval = null;
+
 function watchFile() {
+  if (fsWatcher) {
+    fsWatcher.close();
+    fsWatcher = null;
+  }
+  if (pollInterval) {
+    clearInterval(pollInterval);
+    pollInterval = null;
+  }
   try {
-    fs.watch(LEAN_FILE, { persistent: true }, () => scheduleRefresh());
+    fsWatcher = fs.watch(LEAN_FILE, { persistent: true }, () => scheduleRefresh());
   } catch (err) {
     console.error(`Could not watch ${LEAN_FILE}: ${err.message}`);
   }
   // Fallback poll in case fs.watch misses events (some filesystems/editors).
   let lastMtime = 0;
-  setInterval(() => {
+  pollInterval = setInterval(() => {
     try {
       const { mtimeMs } = fs.statSync(LEAN_FILE);
       if (mtimeMs !== lastMtime) {
@@ -136,6 +189,45 @@ function watchFile() {
       // ignore, file may not exist yet
     }
   }, 1000);
+}
+
+// Switch the file being watched/elaborated — stops the current Lean
+// client and fs watcher, then starts fresh ones pointed at the new file.
+async function selectFile(fileId) {
+  const target = PROOFS.find((p) => p.id === fileId);
+  if (!target || target.path === LEAN_FILE) return;
+
+  LEAN_FILE = target.path;
+  leanStatus = 'starting';
+  diagnosticsCount = 0;
+
+  const content = readFileSafe();
+  currentHtml = renderHtml(content);
+  sendToAll();
+
+  if (leanClient) {
+    leanClient.stop();
+    leanClient = null;
+  }
+
+  leanClient = new LeanClient(LEAN_FILE, {
+    projectRoot: LEAN_PROJECT_ROOT,
+    onStatus: (status) => {
+      leanStatus = status;
+      sendToAll();
+    },
+    onDiagnostics: (diags) => {
+      diagnosticsCount = diags.filter((d) => d.severity === 1 || d.severity === 2).length;
+      sendToAll();
+    },
+  });
+  leanClient.start(content).catch((err) => {
+    console.error('Failed to start Lean language server:', err);
+    leanStatus = 'crashed';
+    sendToAll();
+  });
+
+  watchFile();
 }
 
 const PAGE = `<!DOCTYPE html>
@@ -201,6 +293,34 @@ const PAGE = `<!DOCTYPE html>
     margin: 0 0 34px 0;
     width: 100%;
     max-width: 100%;
+  }
+  #menubar {
+    position: sticky;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 40px;
+    padding: 0 16px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--statusbar-bg);
+    border-bottom: 1px solid var(--border);
+    z-index: 400;
+  }
+  #menubar label {
+    font-size: 12px;
+    color: var(--muted);
+  }
+  #proofSelect {
+    font-family: inherit;
+    font-size: 13px;
+    padding: 4px 8px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--btn-bg);
+    color: var(--btn-fg);
+    cursor: pointer;
   }
   #codewrap {
     width: 100%;
@@ -313,6 +433,10 @@ const PAGE = `<!DOCTYPE html>
 </style>
 </head>
 <body>
+<div id="menubar">
+  <label for="proofSelect">Proof</label>
+  <select id="proofSelect"></select>
+</div>
 <main>
   <div id="codewrap"><pre><code>loading&hellip;</code></pre></div>
 </main>
@@ -328,6 +452,7 @@ const PAGE = `<!DOCTYPE html>
   var fileEl = document.getElementById('filepath');
   var tooltip = document.getElementById('tooltip');
   var themeToggle = document.getElementById('themeToggle');
+  var proofSelect = document.getElementById('proofSelect');
 
   var lineTokMap = null; // Map<lineNumber, Element[]> of .tok spans, for range highlighting
 
@@ -542,6 +667,32 @@ const PAGE = `<!DOCTYPE html>
     hideTooltip();
   });
 
+  // --- proof selector menu ---
+  var lastFilesKey = null; // avoid rebuilding <option>s (and losing focus) every SSE tick
+
+  function renderMenu(files, currentFile) {
+    var key = JSON.stringify(files);
+    if (key !== lastFilesKey) {
+      lastFilesKey = key;
+      proofSelect.innerHTML = '';
+      for (var i = 0; i < files.length; i++) {
+        var opt = document.createElement('option');
+        opt.value = files[i].id;
+        opt.textContent = files[i].label;
+        proofSelect.appendChild(opt);
+      }
+    }
+    if (currentFile) proofSelect.value = currentFile;
+  }
+
+  proofSelect.addEventListener('change', function () {
+    fetch('/api/select', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: proofSelect.value }),
+    }).catch(function () { /* SSE will reflect whatever the server ends up at */ });
+  });
+
   // --- SSE live updates ---
   function connect() {
     var es = new EventSource('/events');
@@ -549,6 +700,7 @@ const PAGE = `<!DOCTYPE html>
       var data = JSON.parse(e.data);
       lastData = data;
       fileEl.textContent = data.file;
+      if (data.files) renderMenu(data.files, data.currentFile);
       renderForCurrentTheme();
       hideTooltip();
     };
@@ -574,12 +726,34 @@ const server = http.createServer((req, res) => {
         htmlDark: currentHtml.dark,
         htmlLight: currentHtml.light,
         file: LEAN_FILE,
+        files: PROOFS.map((p) => ({ id: p.id, label: p.label })),
+        currentFile: currentFileId(),
         leanStatus,
         diagnosticsCount,
       })}\n\n`
     );
     req.on('close', () => {
       clients = clients.filter((c) => c !== res);
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === '/api/select') {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+      if (body.length > 1e4) req.destroy();
+    });
+    req.on('end', async () => {
+      try {
+        const { id } = JSON.parse(body);
+        await selectFile(id);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: err.message }));
+      }
     });
     return;
   }
@@ -630,6 +804,7 @@ async function main() {
   currentHtml = renderHtml(initialContent);
 
   leanClient = new LeanClient(LEAN_FILE, {
+    projectRoot: LEAN_PROJECT_ROOT,
     onStatus: (status) => {
       leanStatus = status;
       sendToAll();
@@ -648,6 +823,8 @@ async function main() {
 
   server.listen(PORT, () => {
     console.log(`Lean live viewer running on http://localhost:${PORT}`);
+    console.log(`Proofs directory: ${PROOFS_DIR}`);
+    console.log(`Available proofs: ${PROOFS.map((p) => p.id).join(', ') || '(none found)'}`);
     console.log(`Watching file: ${LEAN_FILE}`);
   });
 }

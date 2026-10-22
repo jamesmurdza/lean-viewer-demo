@@ -8,6 +8,9 @@ changes, with no manual refresh. Hover info is powered by Lean's own
 language server (`lake serve`, i.e. `lean --server`) via a minimal LSP
 client (`lspClient.js`).
 
+A dropdown menu at the top of the page lets you pick which proof file to
+view/elaborate, out of `lean/proofs/*.lean`.
+
 ## Running the app
 
 ```sh
@@ -15,8 +18,23 @@ npm install
 npm start
 ```
 
-This serves the viewer at `http://localhost:8080`, watching
-`lean/Test.lean` by default (override with `LEAN_FILE=/path/to/file.lean`).
+This serves the viewer at `http://localhost:8080`. It shows a **Proof**
+dropdown listing every `lean/proofs/*.lean` file, and watches/elaborates
+whichever one is selected (override the directory with
+`LEAN_PROOFS_DIR=/path/to/dir`). Selecting a different proof from the menu
+calls `POST /api/select`, which stops the current `lake serve` process and
+starts a fresh one against the newly selected file — the current proofs
+are:
+
+| File | What it shows |
+|---|---|
+| `01_basics.lean` | Plain `Nat` commutativity proof (no Mathlib needed) |
+| `02_algebra.lean` | Mathlib's `ring` tactic normalizing a polynomial identity |
+| `03_real_analysis.lean` | `Filter.Tendsto` (lim 1/n = 0) and a `continuity` proof |
+
+To add a new proof, drop another `.lean` file into `lean/proofs/` (named
+`NN_name.lean` so it sorts into the menu in a sensible order) — the menu
+picks it up automatically on server restart, no code changes needed.
 
 ## Setting up Lean + Mathlib
 
@@ -63,9 +81,12 @@ Mathlib`, which should finish in well under a minute and report
 ### 3. Point the app's LSP client at the Lake project
 
 `lspClient.js` spawns `lake serve` (not bare `lean --server`) with `cwd`
-set to the directory containing the watched file. `lake serve` is what
-sets up `LEAN_PATH` for Mathlib before execing `lean --server` — using bare
-`lean --server` would **not** see Mathlib and `import Mathlib` would fail
+set to the Lake project root (`lean/`, passed explicitly as
+`projectRoot` — not just the watched file's own directory, since the
+proof files live one level down in `lean/proofs/`). `lake serve` is what
+sets up `LEAN_PATH` for Mathlib before execing `lean --server` — using
+bare `lean --server`, or running it from a subdirectory with no
+`lakefile.toml`, would **not** see Mathlib and `import Mathlib` would fail
 to resolve.
 
 ### Keeping disk usage down
