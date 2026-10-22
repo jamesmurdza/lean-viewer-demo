@@ -123,3 +123,27 @@ on first open, the *first* hover/elaboration of a file with `import
 Mathlib` is slow in this sandbox (several minutes) even though cache
 download and build were fast — this is one-time per server process, not a
 disk space issue.
+
+## Confirmed working
+
+Verified end-to-end in this sandbox: `npm start`, then watched
+`/events` (SSE) until `leanStatus` moved from `"starting"` →
+`"elaborating"` → `"ready"` with `diagnosticsCount: 0` for
+`lean/Test.lean`, which includes a real Mathlib proof:
+
+```lean
+example (a b : ℝ) : (a + b) ^ 2 = a ^ 2 + 2 * a * b + b ^ 2 := by ring
+```
+
+`ring` is a Mathlib tactic, and it closed the goal with zero diagnostics,
+confirming Mathlib is fully usable from the app.
+
+**Elaboration time**: reaching `"ready"` took **~7–8 minutes** after a
+fresh `lake serve` process start (observed twice, consistently). This is
+the cost of `lean --server` loading all of Mathlib's `.olean` files into
+memory for the first file that imports it — it happens once per server
+process (e.g. once per `npm start`/restart), not per edit. Once `"ready"`,
+subsequent edits to the watched file get diagnostics much faster since the
+environment is already loaded. If you restart the Node server, expect
+hover info and diagnostics to be unavailable/stale for several minutes
+while it re-elaborates.
