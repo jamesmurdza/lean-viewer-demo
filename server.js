@@ -406,8 +406,8 @@ const PAGE = `<!DOCTYPE html>
     top: 0;
     left: 0;
     right: 0;
-    height: 40px;
-    padding: 0 16px;
+    min-height: 40px;
+    padding: 8px 16px;
     display: flex;
     align-items: center;
     justify-content: space-between;
