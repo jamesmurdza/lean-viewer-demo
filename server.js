@@ -329,17 +329,29 @@ const PAGE = `<!DOCTYPE html>
     cursor: wait;
     opacity: 0.6;
   }
-  .spinner {
+  #skeleton {
     display: none;
-    width: 13px;
-    height: 13px;
-    border-radius: 50%;
-    border: 2px solid var(--border);
-    border-top-color: var(--accent);
-    animation: spin 0.7s linear infinite;
+    padding: 18px 20px;
   }
-  .spinner.active { display: inline-block; }
-  @keyframes spin { to { transform: rotate(360deg); } }
+  #skeleton.active { display: block; }
+  #skeleton.active + #codewrap { display: none; }
+  #skeleton .sk-line {
+    height: 14px;
+    margin: 11px 0;
+    border-radius: 4px;
+    background: linear-gradient(
+      90deg,
+      var(--border) 25%,
+      var(--btn-bg) 37%,
+      var(--border) 63%
+    );
+    background-size: 400% 100%;
+    animation: sk-shimmer 1.4s ease infinite;
+  }
+  @keyframes sk-shimmer {
+    0% { background-position: 100% 50%; }
+    100% { background-position: 0% 50%; }
+  }
   #codewrap {
     width: 100%;
     max-width: 100%;
@@ -460,9 +472,18 @@ const PAGE = `<!DOCTYPE html>
 <div id="menubar">
   <label for="proofSelect">Proof</label>
   <select id="proofSelect"></select>
-  <span class="spinner" id="proofSpinner" title="Elaborating…"></span>
 </div>
 <main>
+  <div id="skeleton">
+    <div class="sk-line" style="width: 40%"></div>
+    <div class="sk-line" style="width: 0%"></div>
+    <div class="sk-line" style="width: 75%"></div>
+    <div class="sk-line" style="width: 58%"></div>
+    <div class="sk-line" style="width: 62%"></div>
+    <div class="sk-line" style="width: 0%"></div>
+    <div class="sk-line" style="width: 85%"></div>
+    <div class="sk-line" style="width: 45%"></div>
+  </div>
   <div id="codewrap"><pre><code>loading&hellip;</code></pre></div>
 </main>
 <div id="statusbar">
@@ -478,7 +499,7 @@ const PAGE = `<!DOCTYPE html>
   var tooltip = document.getElementById('tooltip');
   var themeToggle = document.getElementById('themeToggle');
   var proofSelect = document.getElementById('proofSelect');
-  var proofSpinner = document.getElementById('proofSpinner');
+  var skeleton = document.getElementById('skeleton');
 
   var lineTokMap = null; // Map<lineNumber, Element[]> of .tok spans, for range highlighting
 
@@ -696,20 +717,24 @@ const PAGE = `<!DOCTYPE html>
 
   function setSwitching(isSwitching) {
     proofSelect.disabled = isSwitching;
-    proofSpinner.classList.toggle('active', isSwitching);
+    skeleton.classList.toggle('active', isSwitching);
   }
 
+  var pendingFile = null; // id we're waiting on the server to confirm/send
+
   proofSelect.addEventListener('change', function () {
-    // Flip to the "switching" state right away — the server pushes the new
-    // file's source over SSE immediately (before Lean has even started
-    // re-elaborating it), so the code itself shows up right away; the
-    // spinner just covers the gap until hover/diagnostics catch up.
+    // Show the skeleton right away — just long enough to cover the
+    // network round trip to /api/select. The server pushes the new
+    // file's source over SSE as soon as it switches (well before Lean
+    // finishes re-elaborating it), so real code replaces the skeleton
+    // quickly; hover/diagnostics catch up separately in the background.
+    pendingFile = proofSelect.value;
     setSwitching(true);
     fetch('/api/select', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id: proofSelect.value }),
-    }).catch(function () { setSwitching(false); });
+    }).catch(function () { pendingFile = null; setSwitching(false); });
   });
 
   // --- SSE live updates ---
@@ -720,7 +745,8 @@ const PAGE = `<!DOCTYPE html>
       lastData = data;
       fileEl.textContent = data.file;
       if (data.files) renderMenu(data.files, data.currentFile);
-      setSwitching(data.leanStatus === 'starting' || data.leanStatus === 'elaborating');
+      if (pendingFile && data.currentFile === pendingFile) pendingFile = null;
+      setSwitching(!!pendingFile);
       renderForCurrentTheme();
       hideTooltip();
     };
