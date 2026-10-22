@@ -59,6 +59,59 @@ const THEMES = {
   light: { shiki: 'github-light-default', bg: '#ffffff', fg: '#1f2328' },
 };
 
+// Shiki's bundled Lean grammar has no working rule for "--" line comments
+// (only block comments `/- ... -/` are recognized — "--" text, including
+// any keywords inside it, gets colored as plain/default code). We detect
+// "--" comments ourselves and force the correct comment color over that
+// range, overriding whatever Shiki assigned. commentColor is filled in at
+// startup by probing a (correctly-handled) block comment per theme.
+function computeLineCommentStarts(content) {
+  const lines = content.split('\n');
+  const starts = new Array(lines.length).fill(-1);
+  let inBlockComment = false;
+  let inString = false;
+  for (let li = 0; li < lines.length; li++) {
+    const line = lines[li];
+    let ch = 0;
+    while (ch < line.length) {
+      if (inBlockComment) {
+        if (line.startsWith('-/', ch)) {
+          inBlockComment = false;
+          ch += 2;
+        } else {
+          ch++;
+        }
+        continue;
+      }
+      if (inString) {
+        if (line[ch] === '\\') {
+          ch += 2;
+          continue;
+        }
+        if (line[ch] === '"') inString = false;
+        ch++;
+        continue;
+      }
+      if (line.startsWith('/-', ch)) {
+        inBlockComment = true;
+        ch += 2;
+        continue;
+      }
+      if (line[ch] === '"') {
+        inString = true;
+        ch++;
+        continue;
+      }
+      if (line.startsWith('--', ch)) {
+        starts[li] = ch;
+        break;
+      }
+      ch++;
+    }
+  }
+  return starts;
+}
+
 let clients = [];
 let highlighter = null;
 let leanStatus = 'starting'; // starting | elaborating | ready | crashed | stopped
@@ -96,14 +149,17 @@ function renderHtmlForTheme(content, themeKey) {
   }
   try {
     const lines = highlighter.codeToTokensBase(content, { lang: 'lean', theme: theme.shiki });
+    const commentStarts = computeLineCommentStarts(content);
     let body = '';
     lines.forEach((lineTokens, lineIdx) => {
       let ch = 0;
       let lineHtml = '';
+      const commentStart = commentStarts[lineIdx];
       for (const tok of lineTokens) {
-        const color = tok.color || theme.fg;
         const pieces = tok.content.match(SUBTOKEN_RE) || [tok.content];
         for (const piece of pieces) {
+          const inLineComment = commentStart !== -1 && ch >= commentStart;
+          const color = inLineComment ? theme.commentColor || theme.fg : tok.color || theme.fg;
           if (/^\s+$/.test(piece)) {
             lineHtml += escapeHtml(piece);
           } else {
@@ -979,6 +1035,14 @@ async function main() {
     themes: [THEMES.dark.shiki, THEMES.light.shiki],
     langs: ['lean'],
   });
+
+  // Block comments ARE correctly recognized by the grammar, so probe one
+  // to get each theme's real "comment" scope color, used to override the
+  // (broken) "--" line-comment coloring above.
+  for (const theme of Object.values(THEMES)) {
+    const probe = highlighter.codeToTokensBase('/- x -/', { lang: 'lean', theme: theme.shiki });
+    theme.commentColor = probe[0]?.[0]?.color || theme.fg;
+  }
 
   const initialContent = readFileSafe();
   currentHtml = renderHtml(initialContent);
